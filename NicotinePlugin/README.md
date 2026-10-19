@@ -8,7 +8,7 @@ uses. Because of that, Tubifarry's **Nicotine+** indexer and download client run
 the Slskd ones. Search strategies, result scoring, retries, the ignore list and rate limits all
 behave the same way.
 
-Tested with Nicotine+ 3.3.10. It needs only the Python standard library, so nothing extra has to
+Tested with Nicotine+ 3.3.10 and 3.3.11. It needs only the Python standard library, so nothing extra has to
 be installed.
 
 ## Install

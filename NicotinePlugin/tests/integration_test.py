@@ -168,6 +168,28 @@ def emit_peer_message(event_name, msg, username, addr=("10.0.0.1", 2234)):
     events.emit_main_thread(event_name, msg)
 
 
+def allowed_ids(msg_class):
+    """Response IDs registered with the network thread (Nicotine+ 3.3.11+)."""
+
+    allowed = set()
+
+    for msg in list(SENT_MESSAGES):
+        name = msg.__class__.__name__
+
+        if name in {"AddAllowedResponse", "RemoveAllowedResponse"} and msg.msg_class is msg_class:
+            (allowed.add if name == "AddAllowedResponse" else allowed.discard)(msg.response_id)
+
+    return allowed
+
+
+def search_token_allowed(token):
+    if hasattr(slskmessages, "SEARCH_TOKENS_ALLOWED"):  # Nicotine+ 3.3.10 and earlier
+        return token in slskmessages.SEARCH_TOKENS_ALLOWED
+
+    return token in allowed_ids(slskmessages.FileSearchResponse)
+
+
+GATED_REPLIES = hasattr(slskmessages, "AddAllowedResponse")
 FLAC_ATTRS = {1: 215, 4: 44100, 5: 16}
 MP3_ATTRS = {0: 320, 1: 215, 2: 0}
 
@@ -285,7 +307,7 @@ def test_search():
     status, body, _headers = request("GET", f"/api/v0/searches/{search_id}?includeResponses=True")
     check(body["state"] == "Completed, TimedOut" and body["isComplete"], "search state is Completed, TimedOut")
     dump("search", body)
-    check(wait_for(lambda: token not in slskmessages.SEARCH_TOKENS_ALLOWED, 3),
+    check(wait_for(lambda: not search_token_allowed(token), 3),
           "search token no longer accepted after completion")
 
     peer1 = next(item for item in body["responses"] if item["username"] == "peer1")
@@ -359,9 +381,15 @@ def test_browse_directory():
 
     folder = "Music\\Artist\\Album (2020)"
 
+    registered = []
+
     def reply():
         if not wait_for(lambda: any(isinstance(msg, slskmessages.FolderContentsRequest) for msg in SENT_MESSAGES)):
             return
+
+        if GATED_REPLIES:
+            # Nicotine+ drops replies whose username + folder was not registered first
+            registered.append("peer1" + folder in allowed_ids(slskmessages.FolderContentsResponse))
 
         emit_peer_message("folder-contents-response", slskmessages.FolderContentsResponse(
             directory=folder, token=1, shares={folder: [
@@ -375,9 +403,14 @@ def test_browse_directory():
 
     sent = [msg for msg in SENT_MESSAGES if isinstance(msg, slskmessages.FolderContentsRequest)]
     check(sent and sent[-1].dir == folder and sent[-1].username == "peer1", "FolderContentsRequest sent to peer")
-    check(status == 200 and len(body) == 1 and body[0]["fileCount"] == 3, "folder contents returned")
+    check(status == 200 and len(body) == 1 and body[0]["fileCount"] == 3, f"folder contents returned ({status})" if status == 200 else f"folder contents returned: {status} {body}")
     check(body and body[0]["files"][0]["filename"] == "01 - One.flac", "folder file names are basenames")
     dump("directory", body)
+
+    if GATED_REPLIES:
+        check(registered == [True], "folder reply registered with Nicotine+ before the request (3.3.11+)")
+        check(wait_for(lambda: "peer1" + folder not in allowed_ids(slskmessages.FolderContentsResponse)),
+              "folder reply unregistered afterwards")
 
     sent_before = len(SENT_MESSAGES)
     status, body, headers = request("POST", "/api/v0/users/peer1/directory", {"directory": folder})
@@ -406,7 +439,9 @@ def test_browse_directory():
                                 for msg in SENT_MESSAGES)):
             msg = next(msg for msg in SENT_MESSAGES
                        if isinstance(msg, slskmessages.FolderContentsRequest) and msg.dir == unreachable)
-            events.emit_main_thread("peer-connection-error", "ghost", "P", [msg], True, False)
+            # Keyword arguments, exactly like Nicotine+ slskproto emits them
+            events.emit_main_thread("peer-connection-error", username="ghost", conn_type="P", msgs=[msg],
+                                    is_offline=True)
 
     threading.Thread(target=fail_connection, daemon=True).start()
     started = time.time()

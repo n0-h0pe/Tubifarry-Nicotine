@@ -36,7 +36,15 @@ from pynicotine.slskmessages import UserStatus
 from pynicotine.transfers import TransferStatus
 from pynicotine.utils import clean_file
 
-API_VERSION = "1.1.1"
+try:
+    # Nicotine+ 3.3.11+ only parses peer replies that were registered as expected beforehand
+    from pynicotine.slskmessages import AddAllowedResponse
+    from pynicotine.slskmessages import FolderContentsResponse
+    from pynicotine.slskmessages import RemoveAllowedResponse
+except ImportError:
+    AddAllowedResponse = RemoveAllowedResponse = FolderContentsResponse = None
+
+API_VERSION = "1.2.0"
 TRANSFER_ID_NAMESPACE = uuid.UUID("0b5e7f0e-2a51-4c56-9b0e-7d1f3f6c9a11")
 STATE_FILE_NAME = "tubifarry_api.json"
 
@@ -617,7 +625,6 @@ class Plugin(BasePlugin):
 
         self._load_state()
 
-        events.connect("folder-contents-response", self._folder_contents_response)
         events.connect("peer-connection-error", self._peer_connection_error)
         events.connect("peer-connection-closed", self._peer_connection_closed)
         events.connect("update-download", self._update_download)
@@ -625,13 +632,16 @@ class Plugin(BasePlugin):
         events.connect("clear-download", self._clear_download)
         events.connect("server-disconnect", self._server_disconnect)
 
-        # Nicotine+ discards search responses for tokens it doesn't know about before
-        # other handlers run, so our handler has to go first
-        try:
-            events._callbacks["file-search-response"].insert(  # pylint: disable=protected-access
-                0, self._file_search_response)
-        except AttributeError:
-            events.connect("file-search-response", self._file_search_response)
+        # Nicotine+ clears the token / folder of replies it didn't request itself before other
+        # handlers run, so our handlers have to go first
+        for event_name, callback in (
+            ("file-search-response", self._file_search_response),
+            ("folder-contents-response", self._folder_contents_response)
+        ):
+            try:
+                events._callbacks[event_name].insert(0, callback)  # pylint: disable=protected-access
+            except AttributeError:
+                events.connect(event_name, callback)
 
         self._settings_timer_id = events.schedule(delay=3, callback=self._check_settings, repeat=True)
         self._save_timer_id = events.schedule(delay=60, callback=self._save_state, repeat=True)
@@ -990,13 +1000,13 @@ class Plugin(BasePlugin):
         self._searches.pop(search.id, None)
         self._searches_by_token.pop(search.token, None)
 
-    def _file_search_response(self, msg):
+    def _file_search_response(self, msg, *_args, **_kwargs):
         """Peer code 9, runs on the main thread before Nicotine+'s own handler."""
 
         with self._lock:
             search = self._searches_by_token.get(msg.token)
 
-        if search is None or search.is_complete:
+        if search is None or search.is_complete or msg.list is None:
             return
 
         username = msg.username
@@ -1037,7 +1047,7 @@ class Plugin(BasePlugin):
         if completed_state is not None:
             self.core.search.remove_allowed_token(search.token)
 
-    def _server_disconnect(self, *_args):
+    def _server_disconnect(self, *_args, **_kwargs):
 
         with self._lock:
             searches = [search for search in self._searches.values() if not search.is_complete]
@@ -1096,6 +1106,7 @@ class Plugin(BasePlugin):
 
                 if not pending:
                     self._folder_requests.pop(key, None)
+                    events.invoke_main_thread(self._forget_allowed_folder, request)
 
         folders = request.result or None
 
@@ -1132,12 +1143,31 @@ class Plugin(BasePlugin):
             raise ApiError(409, "Nicotine+ is not connected to the Soulseek server")
 
         self._folder_token = increment_token(self._folder_token)
+
+        if AddAllowedResponse is not None:
+            self.core.send_message_to_network_thread(
+                AddAllowedResponse(FolderContentsResponse, request.username + request.folder_path))
+
         self.core.send_message_to_peer(
             request.username,
             FolderContentsRequest(request.folder_path, self._folder_token, legacy_client=request.legacy_attempt)
         )
 
-    def _folder_contents_response(self, msg, *_args):
+    def _forget_allowed_folder(self, request):
+        """Main thread. Keep the registration if Nicotine+ itself is downloading the same folder."""
+
+        if RemoveAllowedResponse is None:
+            return
+
+        requested_folders = getattr(self.core.downloads, "_requested_folders", {})
+
+        if request.folder_path in requested_folders.get(request.username, {}):
+            return
+
+        self.core.send_message_to_network_thread(
+            RemoveAllowedResponse(FolderContentsResponse, request.username + request.folder_path))
+
+    def _folder_contents_response(self, msg, *_args, **_kwargs):
         """Peer code 37."""
 
         key = folder_key(msg.username, msg.dir)
@@ -1158,6 +1188,10 @@ class Plugin(BasePlugin):
             if request.done.is_set():
                 continue
 
+            if msg.list is None:
+                # Reply was not parsed by Nicotine+ (not registered as expected)
+                continue
+
             if not msg.list and not request.legacy_attempt:
                 # Same fallback as Nicotine+: retry with latin-1 encoding for legacy clients
                 request.legacy_attempt = True
@@ -1167,7 +1201,8 @@ class Plugin(BasePlugin):
             request.result = msg.list or {}
             request.done.set()
 
-    def _peer_connection_error(self, username, _conn_type, msgs, is_offline=False, is_timeout=True):
+    def _peer_connection_error(self, username=None, conn_type=None, msgs=None, is_offline=False, is_timeout=True,
+                               **_kwargs):  # pylint: disable=unused-argument
         """Fail folder requests right away when the peer can't be reached, instead of waiting for the timeout."""
 
         if not msgs:
@@ -1187,8 +1222,8 @@ class Plugin(BasePlugin):
                 if not request.done.is_set():
                     request.fail(f"{username} {reason}, could not browse {request.folder_path}")
 
-    def _peer_connection_closed(self, username, conn_type, msgs=None):
-        self._peer_connection_error(username, conn_type, msgs, is_timeout=False)
+    def _peer_connection_closed(self, username=None, conn_type=None, msgs=None, **_kwargs):
+        self._peer_connection_error(username=username, conn_type=conn_type, msgs=msgs, is_timeout=False)
 
     # Downloads #
 
@@ -1203,7 +1238,7 @@ class Plugin(BasePlugin):
 
         return record
 
-    def _update_download(self, transfer, *_args):
+    def _update_download(self, transfer, *_args, **_kwargs):
         """Keep timestamps accurate between API polls (main thread)."""
 
         tid = transfer_id(transfer.username, transfer.virtual_path)
@@ -1213,7 +1248,7 @@ class Plugin(BasePlugin):
             record.update_from(transfer)
             self._records_dirty = record.is_api or self._records_dirty
 
-    def _clear_download(self, transfer, *_args):
+    def _clear_download(self, transfer, *_args, **_kwargs):
 
         tid = transfer_id(transfer.username, transfer.virtual_path)
         record = self._records.get(tid)
