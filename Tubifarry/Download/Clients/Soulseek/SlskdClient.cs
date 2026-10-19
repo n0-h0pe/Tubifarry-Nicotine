@@ -11,15 +11,18 @@ using NzbDrone.Core.RemotePathMappings;
 
 namespace Tubifarry.Download.Clients.Soulseek;
 
-public class SlskdClient : DownloadClientBase<SlskdProviderSettings>
+/// <summary>
+/// Download client for any Soulseek client exposing the slskd API (slskd itself, or Nicotine+ with the Tubifarry API plugin).
+/// </summary>
+public abstract class SlskdClientBase<TSettings> : DownloadClientBase<TSettings>
+    where TSettings : SlskdProviderSettings, new()
 {
     private readonly ISlskdDownloadManager _manager;
     private readonly ISlskdApiClient _apiClient;
 
-    public override string Name => "Slskd";
     public override string Protocol => nameof(SoulseekDownloadProtocol);
 
-    public SlskdClient(
+    protected SlskdClientBase(
         ISlskdDownloadManager manager,
         ISlskdApiClient apiClient,
         IConfigService configService,
@@ -60,4 +63,17 @@ public class SlskdClient : DownloadClientBase<SlskdProviderSettings>
 
     private OsPath GetRemoteToLocal() =>
         _remotePathMappingService.RemapRemoteToLocal(Settings.Host, new OsPath(Settings.DownloadPath));
+}
+
+public class SlskdClient(
+    ISlskdDownloadManager manager,
+    ISlskdApiClient apiClient,
+    IConfigService configService,
+    IDiskProvider diskProvider,
+    IRemotePathMappingService remotePathMappingService,
+    ILocalizationService localizationService,
+    Logger logger)
+    : SlskdClientBase<SlskdProviderSettings>(manager, apiClient, configService, diskProvider, remotePathMappingService, localizationService, logger)
+{
+    public override string Name => "Slskd";
 }
