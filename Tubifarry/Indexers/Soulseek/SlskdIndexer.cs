@@ -60,15 +60,15 @@ namespace Tubifarry.Indexers.Soulseek
                 _logger.Debug($"TestConnection Response: {response.Content}");
 
                 if (response.StatusCode != HttpStatusCode.OK)
-                    return new ValidationFailure("BaseUrl", $"Unable to connect to Slskd. Status: {response.StatusCode}");
+                    return new ValidationFailure("BaseUrl", $"Unable to connect to {Name}. Status: {response.StatusCode}");
 
                 dynamic? jsonResponse = JsonConvert.DeserializeObject<dynamic>(response.Content);
                 if (jsonResponse == null)
-                    return new ValidationFailure("BaseUrl", "Failed to parse Slskd response.");
+                    return new ValidationFailure("BaseUrl", $"Failed to parse {Name} response.");
 
                 string? serverState = jsonResponse?.server?.state?.ToString();
                 if (string.IsNullOrEmpty(serverState) || !serverState.Contains("Connected"))
-                    return new ValidationFailure("BaseUrl", $"Slskd server is not connected. State: {serverState}");
+                    return new ValidationFailure("BaseUrl", $"{Name} is not connected to the Soulseek server. State: {serverState}");
 
                 if (!string.IsNullOrWhiteSpace(Settings.IgnoreListPath))
                 {
@@ -87,12 +87,12 @@ namespace Tubifarry.Indexers.Soulseek
             }
             catch (HttpException ex)
             {
-                _logger.Warn(ex, "Unable to connect to Slskd.");
-                return new ValidationFailure("BaseUrl", $"Unable to connect to Slskd: {ex.Message}");
+                _logger.Warn(ex, $"Unable to connect to {Name}.");
+                return new ValidationFailure("BaseUrl", $"Unable to connect to {Name}: {ex.Message}");
             }
             catch (Exception ex)
             {
-                _logger.Error(ex, "Unexpected error while testing Slskd connection.");
+                _logger.Error(ex, $"Unexpected error while testing {Name} connection.");
                 return new ValidationFailure(string.Empty, $"Unexpected error: {ex.Message}");
             }
         }

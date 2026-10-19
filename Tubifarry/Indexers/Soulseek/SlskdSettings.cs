@@ -101,13 +101,13 @@ namespace Tubifarry.Indexers.Soulseek
     {
         private static readonly SlskdSettingsValidator Validator = new();
 
-        [FieldDefinition(0, Label = "URL", Type = FieldType.Url, Placeholder = "http://localhost:5030", HelpText = "Slskd instance URL")]
+        [FieldDefinition(0, Label = "URL", Type = FieldType.Url, Placeholder = "http://localhost:5030", HelpText = "Slskd instance URL, or the Tubifarry API plugin URL in Nicotine+")]
         public string BaseUrl { get; set; } = "http://localhost:5030";
 
         [FieldDefinition(1, Label = "External URL", Type = FieldType.Url, Placeholder = "https://slskd.example.com", HelpText = "Public URL for interactive search links", Advanced = true)]
         public string? ExternalUrl { get; set; } = string.Empty;
 
-        [FieldDefinition(2, Label = "API Key", Type = FieldType.Textbox, Privacy = PrivacyLevel.ApiKey, HelpText = "The API key for your Slskd instance. You can find or set this in the Slskd's settings under 'Options'.", Placeholder = "Enter your API key")]
+        [FieldDefinition(2, Label = "API Key", Type = FieldType.Textbox, Privacy = PrivacyLevel.ApiKey, HelpText = "The API key for your Slskd instance (Slskd settings under 'Options'), or for Nicotine+ (Preferences > Plugins > Tubifarry API).", Placeholder = "Enter your API key")]
         public string ApiKey { get; set; } = string.Empty;
 
         [FieldDefinition(3, Type = FieldType.Checkbox, Label = "Audio Files Only", HelpText = "Return only audio file types")]

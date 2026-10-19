@@ -249,18 +249,18 @@ public class SlskdApiClient(IHttpClient httpClient) : ISlskdApiClient
             HttpResponse response = await httpClient.ExecuteAsync(request);
 
             if (response.StatusCode != HttpStatusCode.OK)
-                return new ValidationFailure("BaseUrl", $"Unable to connect to Slskd. Status: {response.StatusCode}");
+                return new ValidationFailure("BaseUrl", $"Unable to connect to the Soulseek client. Status: {response.StatusCode}");
 
             using JsonDocument doc = JsonDocument.Parse(response.Content);
             JsonElement root = doc.RootElement;
 
             if (!root.TryGetProperty("server", out JsonElement serverEl) ||
                 !serverEl.TryGetProperty("state", out JsonElement stateEl))
-                return new ValidationFailure("BaseUrl", "Failed to parse Slskd response: missing 'server' or 'state'.");
+                return new ValidationFailure("BaseUrl", "Failed to parse the Soulseek client response: missing 'server' or 'state'.");
 
             string? serverState = stateEl.GetString();
             if (string.IsNullOrEmpty(serverState) || !serverState.Contains("Connected"))
-                return new ValidationFailure("BaseUrl", $"Slskd server is not connected. State: {serverState}");
+                return new ValidationFailure("BaseUrl", $"The Soulseek client is not connected to the Soulseek server. State: {serverState}");
 
             SlskdDestinationConfig? destinationConfig = await GetDestinationConfigAsync(settings);
             settings.DownloadPath = destinationConfig?.DownloadsDirectory ?? string.Empty;
@@ -278,7 +278,7 @@ public class SlskdApiClient(IHttpClient httpClient) : ISlskdApiClient
         }
         catch (HttpException ex)
         {
-            return new ValidationFailure("BaseUrl", $"Unable to connect to Slskd: {ex.Message}");
+            return new ValidationFailure("BaseUrl", $"Unable to connect to the Soulseek client: {ex.Message}");
         }
         catch (Exception ex)
         {

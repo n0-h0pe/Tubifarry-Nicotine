@@ -35,19 +35,19 @@ namespace Tubifarry.Download.Clients.Soulseek
         private static readonly SlskdProviderSettingsValidator Validator = new();
         private string? _host;
 
-        [FieldDefinition(0, Label = "URL", Type = FieldType.Url, Placeholder = "http://localhost:5030", HelpText = "The URL of your Slskd instance.")]
+        [FieldDefinition(0, Label = "URL", Type = FieldType.Url, Placeholder = "http://localhost:5030", HelpText = "The URL of your Slskd instance, or of the Tubifarry API plugin in Nicotine+.")]
         public string BaseUrl { get; set; } = "http://localhost:5030";
 
-        [FieldDefinition(1, Label = "API Key", Type = FieldType.Textbox, Privacy = PrivacyLevel.ApiKey, HelpText = "The API key for your Slskd instance. You can find or set this in the Slskd's settings under 'Options'.", Placeholder = "Enter your API key")]
+        [FieldDefinition(1, Label = "API Key", Type = FieldType.Textbox, Privacy = PrivacyLevel.ApiKey, HelpText = "The API key for your Slskd instance (Slskd settings under 'Options'), or for Nicotine+ (Preferences > Plugins > Tubifarry API).", Placeholder = "Enter your API key")]
         public string ApiKey { get; set; } = string.Empty;
 
-        [FieldDefinition(3, Label = "Timeout", Type = FieldType.Textbox, HelpText = "Specify the maximum time to wait for a response from the Slskd instance before timing out. Fractional values are allowed (e.g., 1.5 for 1 hour and 30 minutes). Set leave blank for no timeout.", Unit = "hours", Advanced = true, Placeholder = "Enter timeout in hours")]
+        [FieldDefinition(3, Label = "Timeout", Type = FieldType.Textbox, HelpText = "Specify the maximum time to wait for a response from the Soulseek client before timing out. Fractional values are allowed (e.g., 1.5 for 1 hour and 30 minutes). Set leave blank for no timeout.", Unit = "hours", Advanced = true, Placeholder = "Enter timeout in hours")]
         public double? Timeout { get; set; }
 
         [FieldDefinition(4, Label = "Retry Attempts", Type = FieldType.Number, HelpText = "The number of times to retry downloading a file if it fails.", Advanced = true, Placeholder = "Enter retry attempts")]
         public int RetryAttempts { get; set; } = 1;
 
-        [FieldDefinition(5, Label = "Inclusive", Type = FieldType.Checkbox, HelpText = "Include all downloads made in Slskd, or only the ones initialized by this Lidarr instance.", Advanced = true)]
+        [FieldDefinition(5, Label = "Inclusive", Type = FieldType.Checkbox, HelpText = "Include all downloads made in the Soulseek client, or only the ones initialized by this Lidarr instance.", Advanced = true)]
         public bool Inclusive { get; set; }
 
         [FieldDefinition(6, Label = "Clean Directories", Type = FieldType.Checkbox, HelpText = "After importing, remove stale directories.", Advanced = true)]

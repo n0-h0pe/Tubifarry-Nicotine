@@ -14,6 +14,7 @@ For further customization, Codec Tinker lets you convert audio files between for
 
 1. [Installation 🚀](#installation-)
 2. [Soulseek (Slskd) Setup 🎧](#soulseek-slskd-setup-)
+   - [Soulseek (Nicotine+) Setup 🎧](#soulseek-nicotine-setup-)
 3. [YouTube Downloader Setup 🎥](#youtube-downloader-setup-)
 4. [WebClients 📻](#web-clients-)
 5. [Fetching Soundtracks 🎬🎵](#fetching-soundtracks-from-sonarr-and-radarr-)
@@ -50,6 +51,23 @@ Tubifarry supports **Slskd**, the Soulseek client, as both an **indexer** and **
 1. Go to `Settings -> Download Clients` and click **Add**.
 2. Select `Slskd` from the list of download clients.
 3. The download path is fetched from slskd, if it does not match use `Remote Path` settings.
+
+---
+
+### Soulseek (Nicotine+) Setup 🎧
+Tubifarry can also use **[Nicotine+](https://nicotine-plus.org/)** as both an **indexer** and **downloader**. A small Nicotine+ plugin, `NicotinePlugin/tubifarry_api` in this repository, runs an slskd-compatible API inside Nicotine+. The Nicotine+ indexer and download client then work exactly like the Slskd ones.
+
+#### **Installing the Nicotine+ Plugin**:
+1. Copy the `NicotinePlugin/tubifarry_api` folder into your Nicotine+ plugin folder (`%AppData%\nicotine\plugins\` on Windows, `~/.local/share/nicotine/plugins/` on Linux/macOS).
+2. In Nicotine+, enable **Tubifarry API** under `Preferences -> Plugins`.
+3. Open the plugin's **Settings** and copy the generated **API key**. If Lidarr runs on another machine or in Docker, set **Listen address** to `0.0.0.0`.
+
+#### **Setting Up the Nicotine+ Indexer and Download Client**:
+1. Under `Settings -> Indexers` and `Settings -> Download Clients`, click **Add** and select `Nicotine+`.
+2. Set **URL** to `http://localhost:5031` (or your Nicotine+ host) and paste the **API key**.
+3. Downloads are saved in your Nicotine+ download folder, inside a subfolder named after the remote folder. If Lidarr sees this folder under a different path, add a `Remote Path Mapping`.
+
+Nicotine+ must be running and logged in to Soulseek. See [NicotinePlugin/README.md](NicotinePlugin/README.md) for details.
 
 ---
 
