@@ -36,7 +36,7 @@ from pynicotine.slskmessages import UserStatus
 from pynicotine.transfers import TransferStatus
 from pynicotine.utils import clean_file
 
-API_VERSION = "1.1.0"
+API_VERSION = "1.1.1"
 TRANSFER_ID_NAMESPACE = uuid.UUID("0b5e7f0e-2a51-4c56-9b0e-7d1f3f6c9a11")
 STATE_FILE_NAME = "tubifarry_api.json"
 
@@ -44,7 +44,8 @@ MAIN_THREAD_TIMEOUT = 15
 SEARCH_RETENTION = 60 * 60          # Keep finished searches for one hour
 RECORD_RETENTION = 7 * 24 * 60 * 60  # Keep finished API downloads for a week
 MAX_EVENTS = 2000
-FOLDER_REQUEST_TIMEOUT = 20
+FOLDER_REQUEST_TIMEOUT = 12
+FOLDER_CACHE_DURATION = 15 * 60
 
 
 # Helpers #
@@ -76,6 +77,11 @@ def transfer_id(username, virtual_path):
 
 def remote_directory(virtual_path):
     return virtual_path.rpartition("\\")[0]
+
+
+def folder_key(username, folder_path):
+    """Folder replies are matched ignoring case, slash style and trailing separators."""
+    return username, (folder_path or "").replace("/", "\\").rstrip("\\").lower()
 
 
 def lower_keys(data):
@@ -392,14 +398,19 @@ class ApiSearch:
 
 class FolderRequest:
 
-    __slots__ = ("username", "folder_path", "done", "result", "legacy_attempt")
+    __slots__ = ("username", "folder_path", "done", "result", "error", "legacy_attempt")
 
     def __init__(self, username, folder_path):
         self.username = username
         self.folder_path = folder_path
         self.done = threading.Event()
         self.result = None
+        self.error = None
         self.legacy_attempt = False
+
+    def fail(self, error):
+        self.error = error
+        self.done.set()
 
 
 # HTTP #
@@ -477,6 +488,8 @@ def build_handler(api):
                 self.send_header("Content-Type", "application/json; charset=utf-8")
 
             self.send_header("Content-Length", str(len(payload)))
+            self.send_header("Connection", "close")
+            self.close_connection = True
 
             for key, value in response.headers.items():
                 self.send_header(key, value)
@@ -561,7 +574,8 @@ class Plugin(BasePlugin):
         self._batches = {}              # batch id -> slskd batch object (API enqueues)
         self._records_dirty = False
         self._completed_folders = set()  # (username, remote folder) already reported complete
-        self._folder_requests = defaultdict(list)  # (username, folder) -> [FolderRequest]
+        self._folder_requests = defaultdict(list)  # folder_key -> [FolderRequest]
+        self._folder_cache = {}                    # folder_key -> (expiry, folders or None, error)
         self._folder_token = int(time.time()) & 0x7FFFFFFF
         self._events = []
         self._events_offset = 0          # Absolute index of self._events[0]
@@ -604,6 +618,8 @@ class Plugin(BasePlugin):
         self._load_state()
 
         events.connect("folder-contents-response", self._folder_contents_response)
+        events.connect("peer-connection-error", self._peer_connection_error)
+        events.connect("peer-connection-closed", self._peer_connection_closed)
         events.connect("update-download", self._update_download)
         events.connect("abort-download", self._update_download)
         events.connect("clear-download", self._clear_download)
@@ -647,6 +663,8 @@ class Plugin(BasePlugin):
         for event_name, callback in (
             ("file-search-response", self._file_search_response),
             ("folder-contents-response", self._folder_contents_response),
+            ("peer-connection-error", self._peer_connection_error),
+            ("peer-connection-closed", self._peer_connection_closed),
             ("update-download", self._update_download),
             ("abort-download", self._update_download),
             ("clear-download", self._clear_download),
@@ -1039,8 +1057,25 @@ class Plugin(BasePlugin):
         if not folder_path:
             raise ApiError(400, "Directory is required")
 
+        key = folder_key(username, folder_path)
+        now = time.time()
+
+        with self._lock:
+            for cached_key, (expiry, _folders, _error) in list(self._folder_cache.items()):
+                if expiry < now:
+                    del self._folder_cache[cached_key]
+
+            cached = self._folder_cache.get(key)
+
+        if cached is not None:
+            _expiry, folders, error = cached
+
+            if folders is None:
+                raise ApiError(404, f"{error} (cached)")
+
+            return self._folders_to_dict(folders, folder_path)
+
         request = FolderRequest(username, folder_path)
-        key = (username, folder_path)
 
         with self._lock:
             self._folder_requests[key].append(request)
@@ -1049,7 +1084,8 @@ class Plugin(BasePlugin):
             self._call_main(self._send_folder_request, request)
 
             if not request.done.wait(FOLDER_REQUEST_TIMEOUT):
-                raise ApiError(504, f"{username} did not send the contents of {folder_path} in time")
+                request.error = f"{username} did not send the contents of {folder_path} within {FOLDER_REQUEST_TIMEOUT}s"
+                self.log("Folder request timed out: %s", request.error)
 
         finally:
             with self._lock:
@@ -1061,13 +1097,25 @@ class Plugin(BasePlugin):
                 if not pending:
                     self._folder_requests.pop(key, None)
 
-        folders = request.result or {}
+        folders = request.result or None
 
-        if not folders:
-            raise ApiError(404, f"{username} returned no files for {folder_path}")
+        if folders is None and request.error is None:
+            request.error = f"{username} returned no files for {folder_path}"
+
+        with self._lock:
+            self._folder_cache[key] = (time.time() + FOLDER_CACHE_DURATION, folders, request.error)
+
+        if folders is None:
+            raise ApiError(504 if "within" in request.error else 404, request.error)
+
+        return self._folders_to_dict(folders, folder_path)
+
+    @staticmethod
+    def _folders_to_dict(folders, folder_path):
 
         # Requested folder first
-        ordered = sorted(folders.items(), key=lambda item: item[0].rstrip("\\") != folder_path)
+        requested = folder_key("", folder_path)[1]
+        ordered = sorted(folders.items(), key=lambda item: folder_key("", item[0])[1] != requested)
 
         return [
             {
@@ -1092,10 +1140,19 @@ class Plugin(BasePlugin):
     def _folder_contents_response(self, msg, *_args):
         """Peer code 37."""
 
-        key = (msg.username, (msg.dir or "").rstrip("\\"))
+        key = folder_key(msg.username, msg.dir)
 
         with self._lock:
             requests = list(self._folder_requests.get(key, []))
+            other_pending = [] if requests else [
+                request.folder_path for pending_key, pending in self._folder_requests.items()
+                if pending_key[0] == msg.username for request in pending
+            ]
+
+        if other_pending:
+            self.log("Folder reply from %s for '%s' does not match the pending request(s) %s",
+                     (msg.username, msg.dir, other_pending))
+            return
 
         for request in requests:
             if request.done.is_set():
@@ -1109,6 +1166,29 @@ class Plugin(BasePlugin):
 
             request.result = msg.list or {}
             request.done.set()
+
+    def _peer_connection_error(self, username, _conn_type, msgs, is_offline=False, is_timeout=True):
+        """Fail folder requests right away when the peer can't be reached, instead of waiting for the timeout."""
+
+        if not msgs:
+            return
+
+        reason = "is offline" if is_offline else ("could not be reached (timeout)" if is_timeout
+                                                   else "closed the connection")
+
+        for msg in msgs:
+            if not isinstance(msg, FolderContentsRequest):
+                continue
+
+            with self._lock:
+                requests = list(self._folder_requests.get(folder_key(username, msg.dir), []))
+
+            for request in requests:
+                if not request.done.is_set():
+                    request.fail(f"{username} {reason}, could not browse {request.folder_path}")
+
+    def _peer_connection_closed(self, username, conn_type, msgs=None):
+        self._peer_connection_error(username, conn_type, msgs, is_timeout=False)
 
     # Downloads #
 

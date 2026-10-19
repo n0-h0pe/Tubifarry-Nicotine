@@ -285,7 +285,8 @@ def test_search():
     status, body, _headers = request("GET", f"/api/v0/searches/{search_id}?includeResponses=True")
     check(body["state"] == "Completed, TimedOut" and body["isComplete"], "search state is Completed, TimedOut")
     dump("search", body)
-    check(token not in slskmessages.SEARCH_TOKENS_ALLOWED, "search token no longer accepted after completion")
+    check(wait_for(lambda: token not in slskmessages.SEARCH_TOKENS_ALLOWED, 3),
+          "search token no longer accepted after completion")
 
     peer1 = next(item for item in body["responses"] if item["username"] == "peer1")
     check(peer1["hasFreeUploadSlot"] is True and peer1["uploadSpeed"] == 1048576 and peer1["queueLength"] == 2,
@@ -377,6 +378,45 @@ def test_browse_directory():
     check(status == 200 and len(body) == 1 and body[0]["fileCount"] == 3, "folder contents returned")
     check(body and body[0]["files"][0]["filename"] == "01 - One.flac", "folder file names are basenames")
     dump("directory", body)
+
+    sent_before = len(SENT_MESSAGES)
+    status, body, headers = request("POST", "/api/v0/users/peer1/directory", {"directory": folder})
+    check(status == 200 and len(SENT_MESSAGES) == sent_before, "repeat browse served from cache without a new request")
+    check(headers.get("Connection") == "close", "responses close the connection")
+
+    # Reply that differs in case and slash style still matches
+    other = "Music\\Other\\Live Set"
+
+    def reply_differently():
+        if wait_for(lambda: any(isinstance(msg, slskmessages.FolderContentsRequest) and msg.dir == other
+                                for msg in SENT_MESSAGES)):
+            emit_peer_message("folder-contents-response", slskmessages.FolderContentsResponse(
+                directory="music/other/live set/", token=1, shares={"music/other/live set": [
+                    (1, "01.flac", 1, "", FLAC_ATTRS)]}), "peer1")
+
+    threading.Thread(target=reply_differently, daemon=True).start()
+    status, body, _headers = request("POST", "/api/v0/users/peer1/directory", {"directory": other})
+    check(status == 200 and body[0]["fileCount"] == 1, "reply matched ignoring case and slash style")
+
+    # Unreachable peer fails fast instead of waiting for the timeout
+    unreachable = "Share\\Gone"
+
+    def fail_connection():
+        if wait_for(lambda: any(isinstance(msg, slskmessages.FolderContentsRequest) and msg.dir == unreachable
+                                for msg in SENT_MESSAGES)):
+            msg = next(msg for msg in SENT_MESSAGES
+                       if isinstance(msg, slskmessages.FolderContentsRequest) and msg.dir == unreachable)
+            events.emit_main_thread("peer-connection-error", "ghost", "P", [msg], True, False)
+
+    threading.Thread(target=fail_connection, daemon=True).start()
+    started = time.time()
+    status, body, _headers = request("POST", "/api/v0/users/ghost/directory", {"directory": unreachable})
+    check(status == 404 and time.time() - started < 5 and "offline" in body["error"],
+          f"unreachable peer fails fast ({time.time() - started:.1f}s): {body}")
+
+    started = time.time()
+    status, body, _headers = request("POST", "/api/v0/users/ghost/directory", {"directory": unreachable})
+    check(status == 404 and "cached" in body["error"] and time.time() - started < 1, "failure is cached")
 
 
 def transfer_of(username, virtual_path):

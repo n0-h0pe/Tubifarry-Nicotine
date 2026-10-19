@@ -1,4 +1,4 @@
-Version = "1.1.0"
+Version = "1.1.1"
 Authors = ["Tubifarry"]
 Name = "Tubifarry API"
 Description = "Exposes an slskd-compatible HTTP API so Lidarr (via the Tubifarry plugin) can search and download through Nicotine+."
