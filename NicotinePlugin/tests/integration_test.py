@@ -508,10 +508,12 @@ def test_downloads():
     check(two is not None and two["state"] == "Completed, Succeeded", "auto-cleared download still reported")
     dump("transfers_completed", body)
 
-    _status, events_body, _headers = request("GET", "/api/v0/events?offset=1&limit=50")
+    _status, events_body, headers = request("GET", "/api/v0/events?offset=0&limit=2")
     types = [item["type"] for item in events_body]
-    check(types == ["DownloadFileComplete", "DownloadDirectoryComplete"], "DownloadDirectoryComplete event emitted")
-    check(json.loads(events_body[-1]["data"])["remoteDirectoryName"] == folder, "directory event names the folder")
+    check(headers.get("X-Total-Count") == "3", "three events recorded")
+    check(types == ["DownloadDirectoryComplete", "DownloadFileComplete"],
+          "events are returned newest first (DownloadDirectoryComplete last emitted)")
+    check(json.loads(events_body[0]["data"])["remoteDirectoryName"] == folder, "directory event names the folder")
     dump("events", request("GET", "/api/v0/events?offset=0&limit=50")[1])
     config.sections["transfers"]["autoclear_downloads"] = False
 
@@ -564,6 +566,61 @@ def test_downloads():
     check(any(item["username"] == "peer3" for item in saved["downloads"]), "API downloads persisted to disk")
 
 
+def test_batches():
+
+    print("batches (Tubifarry develop)")
+
+    batch_id = "a1b2c3d4-0000-4000-8000-000000000001"
+    files = [
+        {"filename": "Music\\Band\\Album CD1\\01.flac", "size": 10},
+        {"filename": "Music\\Band\\Album CD2\\01.flac", "size": 20}
+    ]
+
+    status, body, _headers = request("POST", "/api/v0/transfers/downloads/batches", {
+        "id": batch_id, "username": "peer4", "files": files,
+        "options": {"externalId": "grab-1", "destination": "Band - Album"}})
+    check(status == 201 and body["id"] == batch_id and len(body["files"]) == 2, "batch enqueue returns 201 with files")
+
+    expected = os.path.join(os.path.normpath(DOWNLOAD_DIR), "Band - Album")
+    check(all(transfer_of("peer4", item["filename"]).folder_path == expected for item in files),
+          "batch destination is the download folder for every file (multi-disc merge)")
+
+    status, body, _headers = request("GET", f"/api/v0/transfers/downloads/batches/{batch_id}")
+    check(status == 200 and body["options"]["destination"] == "Band - Album"
+          and body["options"]["externalId"] == "grab-1" and len(body["files"]) == 2, "batch lookup returns options")
+
+    _status, body, _headers = request("GET", "/api/v0/transfers/downloads/peer4")
+    batch_ids = {item["batchId"] for directory in body["directories"] for item in directory["files"]}
+    check(batch_ids == {batch_id}, "transfers carry their batchId")
+    dump("transfers_batch", body)
+
+    status, _body, _headers = request("POST", "/api/v0/transfers/downloads/batches", {
+        "username": "peer4", "files": [{"filename": "x\\Solo\\a.flac", "size": 1}],
+        "options": {"externalId": "grab-2", "destination": None}})
+    check(status == 201 and transfer_of("peer4", "x\\Solo\\a.flac").folder_path
+          == os.path.join(os.path.normpath(DOWNLOAD_DIR), "Solo"), "batch without destination uses the slskd default layout")
+
+    request("POST", "/api/v0/transfers/downloads/batches", {
+        "username": "peer4", "files": [{"filename": "y\\Z\\b.flac", "size": 1}],
+        "options": {"destination": "../escape"}})
+    check(transfer_of("peer4", "y\\Z\\b.flac").folder_path == os.path.join(os.path.normpath(DOWNLOAD_DIR), "escape"),
+          "'..' segments in a destination are dropped")
+
+    status, body, _headers = request("POST", "/api/v0/transfers/downloads/batches", {"files": files})
+    check(status == 400 and "QueueDownloadRequest" not in json.dumps(body), "batch without username is a plain 400")
+
+    status, _body, _headers = request("GET", "/api/v0/transfers/downloads/batches/missing")
+    check(status == 404, "unknown batch is 404")
+
+    plugin = core.pluginhandler.enabled_plugins["tubifarry_api"]
+    on_main(plugin._save_state, True)  # pylint: disable=protected-access
+
+    with open(os.path.join(DATA_DIR, "tubifarry_api.json"), encoding="utf-8") as file_handle:
+        saved = json.load(file_handle)
+
+    check(any(batch["id"] == batch_id for batch in saved["batches"]), "batches persisted to disk")
+
+
 def test_disable_enable():
 
     print("disable / enable")
@@ -600,6 +657,7 @@ def run_tests():
         test_search_limits()
         test_browse_directory()
         test_downloads()
+        test_batches()
         test_disable_enable()
 
     except Exception:  # pylint: disable=broad-except

@@ -36,7 +36,7 @@ from pynicotine.slskmessages import UserStatus
 from pynicotine.transfers import TransferStatus
 from pynicotine.utils import clean_file
 
-API_VERSION = "1.0.0"
+API_VERSION = "1.1.0"
 TRANSFER_ID_NAMESPACE = uuid.UUID("0b5e7f0e-2a51-4c56-9b0e-7d1f3f6c9a11")
 STATE_FILE_NAME = "tubifarry_api.json"
 
@@ -152,10 +152,10 @@ class DownloadRecord:
 
     __slots__ = ("id", "username", "filename", "size", "is_api", "state", "requested_at", "enqueued_at",
                  "started_at", "ended_at", "bytes_transferred", "average_speed", "elapsed", "remaining",
-                 "place_in_queue", "local_path", "exception")
+                 "place_in_queue", "local_path", "exception", "batch_id")
 
     PERSISTED = ("id", "username", "filename", "size", "state", "requested_at", "enqueued_at", "started_at",
-                 "ended_at", "bytes_transferred", "local_path", "exception")
+                 "ended_at", "bytes_transferred", "local_path", "exception", "batch_id")
 
     def __init__(self, username, filename, size=0, is_api=False):
 
@@ -178,18 +178,20 @@ class DownloadRecord:
         self.place_in_queue = None
         self.local_path = None
         self.exception = None
+        self.batch_id = None
 
     @property
     def directory(self):
         return remote_directory(self.filename)
 
-    def restart(self, size=None):
+    def restart(self, size=None, batch_id=None):
 
         now = time.time()
 
         if size:
             self.size = size
 
+        self.batch_id = batch_id
         self.is_api = True
         self.state = DownloadState.REQUESTED
         self.requested_at = self.enqueued_at = now
@@ -281,6 +283,7 @@ class DownloadRecord:
             "remainingTime": timespan(self.remaining) if self.remaining else None,
             "placeInQueue": self.place_in_queue,
             "exception": self.exception,
+            "batchId": self.batch_id,
             "localFilename": self.local_path
         }
 
@@ -555,6 +558,7 @@ class Plugin(BasePlugin):
         self._searches = {}             # search id -> ApiSearch
         self._searches_by_token = {}    # search token -> ApiSearch
         self._records = {}              # transfer id -> DownloadRecord
+        self._batches = {}              # batch id -> slskd batch object (API enqueues)
         self._records_dirty = False
         self._completed_folders = set()  # (username, remote folder) already reported complete
         self._folder_requests = defaultdict(list)  # (username, folder) -> [FolderRequest]
@@ -575,6 +579,8 @@ class Plugin(BasePlugin):
             ("DELETE", r"/api/v0/searches/(?P<search_id>[^/]+)", self._delete_search),
             ("POST", r"/api/v0/users/(?P<username>[^/]+)/directory", self._browse_directory),
             ("GET", r"/api/v0/transfers/downloads", self._list_downloads),
+            ("POST", r"/api/v0/transfers/downloads/batches", self._create_batch),
+            ("GET", r"/api/v0/transfers/downloads/batches/(?P<batch_id>[^/]+)", self._get_batch),
             ("DELETE", r"/api/v0/transfers/downloads/all/completed", self._clear_completed_downloads),
             ("GET", r"/api/v0/transfers/downloads/(?P<username>[^/]+)", self._get_user_downloads),
             ("POST", r"/api/v0/transfers/downloads/(?P<username>[^/]+)", self._enqueue_downloads),
@@ -844,9 +850,9 @@ class Plugin(BasePlugin):
         offset = max(0, int(query.get("offset") or 0))
         limit = max(1, min(500, int(query.get("limit") or 100)))
 
+        # Newest first, like slskd: Tubifarry only reads the first page to find new events
         with self._lock:
-            start = max(0, offset - self._events_offset)
-            records = self._events[start:start + limit]
+            records = self._events[::-1][offset:offset + limit]
             total = self._events_offset + len(self._events)
 
         return ApiResponse(records, headers={"X-Total-Count": str(total)})
@@ -1289,17 +1295,12 @@ class Plugin(BasePlugin):
 
         return position
 
-    def _enqueue_downloads(self, username, body, **_kwargs):
-
-        if isinstance(body, dict):
-            body = [body]
-
-        if not isinstance(body, list) or not body:
-            raise ApiError(400, "Expected a list of files")
+    @staticmethod
+    def _parse_files(items):
 
         files = []
 
-        for item in body:
+        for item in items if isinstance(items, list) else []:
             item = lower_keys(item)
             filename = str(item.get("filename") or "").replace("/", "\\")
 
@@ -1309,50 +1310,120 @@ class Plugin(BasePlugin):
         if not files:
             raise ApiError(400, "No valid files to enqueue")
 
+        return files
+
+    def _enqueue_downloads(self, username, body, **_kwargs):
+
+        files = self._parse_files([body] if isinstance(body, dict) else body)
+        result = self._call_main(self._enqueue_files, username, files)
+        return ApiResponse(result, status=201)
+
+    def _create_batch(self, body, **_kwargs):
+        """slskd batch enqueue: all files of one grab, with an optional destination subfolder."""
+
+        data = lower_keys(body)
+        username = str(data.get("username") or "").strip()
+
+        if not username:
+            raise ApiError(400, "Username is required")
+
+        files = self._parse_files(data.get("files"))
+        options = lower_keys(data.get("options"))
+        batch_id = str(data.get("id") or uuid.uuid4())
+        destination = options.get("destination") or None
+        batch = {
+            "id": batch_id,
+            "username": username,
+            "requestedAt": utc_iso(time.time()),
+            "options": {
+                "externalId": options.get("externalid"),
+                "destination": destination
+            }
+        }
+
         def enqueue():
-            if not self._is_logged_in():
-                raise ApiError(409, "Nicotine+ is not connected to the Soulseek server")
-
-            downloads = self.core.downloads
-            download_folder = downloads.get_default_download_folder()
-            enqueued = []
-
-            for virtual_path, size in files:
-                folder = remote_directory(virtual_path)
-                folder_name = folder.rpartition("\\")[2]
-
-                # Same layout as slskd: <downloads>/<remote folder name>/<file>
-                destination = os.path.join(download_folder, clean_file(folder_name)) if folder_name else download_folder
-
-                tid = transfer_id(username, virtual_path)
-                record = self._records.get(tid)
-
-                if record is None:
-                    record = self._records[tid] = DownloadRecord(username, virtual_path, size, is_api=True)
-                else:
-                    record.restart(size)
-
-                self._completed_folders.discard((username, folder))
-
-                transfer = downloads.transfers.get(username + virtual_path)
-
-                if transfer is None or transfer.status == TransferStatus.FINISHED:
-                    downloads.enqueue_download(username, virtual_path, folder_path=destination, size=size)
-                else:
-                    # Existing failed/paused download: retry it (no-op for active downloads)
-                    downloads.retry_download(transfer)
-
-                transfer = downloads.transfers.get(username + virtual_path)
-
-                if transfer is not None:
-                    record.update_from(transfer)
-
-                enqueued.append(record.to_dict())
-
-            self._records_dirty = True
-            return {"enqueued": enqueued, "failed": []}
+            result = self._enqueue_files(username, files, batch_id=batch_id, destination=destination)
+            self._batches[batch_id] = batch
+            return dict(batch, files=result["enqueued"], failures=result["failed"])
 
         return ApiResponse(self._call_main(enqueue), status=201)
+
+    def _get_batch(self, batch_id, **_kwargs):
+
+        def lookup():
+            batch = self._batches.get(batch_id)
+
+            if batch is None:
+                return None
+
+            files = [record.to_dict() for record in self._records.values() if record.batch_id == batch_id]
+            return dict(batch, files=files)
+
+        batch = self._call_main(lookup)
+
+        if batch is None:
+            raise ApiError(404, f"Batch {batch_id} not found")
+
+        return batch
+
+    @staticmethod
+    def _destination_folder(download_folder, virtual_path, destination=None):
+
+        if destination:
+            destination = str(destination)
+
+            if os.path.isabs(destination) or re.match(r"^[A-Za-z]:[\\/]", destination):
+                return destination
+
+            segments = [clean_file(segment) for segment in re.split(r"[\\/]+", destination)
+                        if segment and segment not in {".", ".."}]
+
+            if segments:
+                return os.path.join(download_folder, *segments)
+
+        # slskd default layout: <downloads>/<remote folder name>/<file>
+        folder_name = remote_directory(virtual_path).rpartition("\\")[2]
+        return os.path.join(download_folder, clean_file(folder_name)) if folder_name else download_folder
+
+    def _enqueue_files(self, username, files, batch_id=None, destination=None):
+        """Main thread."""
+
+        if not self._is_logged_in():
+            raise ApiError(409, "Nicotine+ is not connected to the Soulseek server")
+
+        downloads = self.core.downloads
+        download_folder = downloads.get_default_download_folder()
+        enqueued = []
+
+        for virtual_path, size in files:
+            tid = transfer_id(username, virtual_path)
+            record = self._records.get(tid)
+
+            if record is None:
+                record = self._records[tid] = DownloadRecord(username, virtual_path, size, is_api=True)
+
+            record.restart(size, batch_id)
+            self._completed_folders.discard((username, remote_directory(virtual_path)))
+
+            transfer = downloads.transfers.get(username + virtual_path)
+
+            if transfer is None or transfer.status == TransferStatus.FINISHED:
+                downloads.enqueue_download(
+                    username, virtual_path, size=size,
+                    folder_path=self._destination_folder(download_folder, virtual_path, destination))
+            else:
+                # Existing failed/paused download: retry it (no-op for active downloads)
+                downloads.retry_download(transfer)
+
+            transfer = downloads.transfers.get(username + virtual_path)
+
+            if transfer is not None:
+                record.update_from(transfer)
+
+            enqueued.append(record.to_dict())
+
+        self._records_dirty = True
+        return {"enqueued": enqueued, "failed": []}
 
     def _delete_download(self, username, tid, query, **_kwargs):
 
@@ -1435,6 +1506,8 @@ class Plugin(BasePlugin):
                 record = DownloadRecord.from_json(item)
                 self._records[record.id] = record
 
+            self._batches = {batch["id"]: batch for batch in data.get("batches", [])}
+
         except (OSError, ValueError, KeyError, TypeError) as error:
             self.log("Unable to load saved download state: %s", error)
 
@@ -1448,12 +1521,14 @@ class Plugin(BasePlugin):
             record.to_json() for record in self._records.values()
             if record.is_api and not (record.ended_at and now - record.ended_at > RECORD_RETENTION)
         ]
+        batch_ids = {record["batch_id"] for record in records if record.get("batch_id")}
+        batches = [batch for batch_id, batch in self._batches.items() if batch_id in batch_ids]
         path = self._state_file_path()
         temp_path = path + ".tmp"
 
         try:
             with open(temp_path, "w", encoding="utf-8") as file_handle:
-                json.dump({"version": 1, "downloads": records}, file_handle)
+                json.dump({"version": 2, "downloads": records, "batches": batches}, file_handle)
 
             os.replace(temp_path, path)
             self._records_dirty = False
