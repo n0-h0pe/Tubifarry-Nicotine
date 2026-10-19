@@ -51,8 +51,10 @@ ban clients that send too many searches.
   A search ends when no new results have arrived for the timeout set in Tubifarry. It also ends
   when it reaches the response or file limit.
 - **Downloads** use the normal Nicotine+ download queue, so they show up in the Downloads tab.
-  Files go to `<Nicotine+ download folder>/<remote folder name>/`. This is the layout Tubifarry
-  expects, so the plugin ignores the "username subfolders" option for API downloads.
+  Files go to `<Nicotine+ download folder>/<destination>/` when Tubifarry sends a batch
+  destination, for example `Artist - Album` or merged multi-disc folders. Otherwise they go to
+  `<Nicotine+ download folder>/<remote folder name>/`, the default slskd layout. The plugin
+  ignores the "username subfolders" option for API downloads.
 - **Status**: Nicotine+ statuses are reported as slskd states. A download that fails (user went
   offline, connection timeout, rejected by the peer) is reported as failed, and Tubifarry then
   runs its retry and failure handling.
@@ -77,6 +79,8 @@ All endpoints need the `X-API-KEY` header.
 | POST | `/api/v0/users/{username}/directory` |
 | GET | `/api/v0/transfers/downloads` |
 | GET, POST | `/api/v0/transfers/downloads/{username}` |
+| POST | `/api/v0/transfers/downloads/batches` (with `options.destination`) |
+| GET | `/api/v0/transfers/downloads/batches/{id}` |
 | GET, DELETE | `/api/v0/transfers/downloads/{username}/{id}` (`?remove=true`) |
 | GET | `/api/v0/transfers/downloads/{username}/{id}/position` |
 | DELETE | `/api/v0/transfers/downloads/all/completed` |

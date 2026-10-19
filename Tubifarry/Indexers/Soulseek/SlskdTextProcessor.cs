@@ -18,9 +18,47 @@ namespace Tubifarry.Indexers.Soulseek
         };
 
         private static readonly string[] VolumeFormats = { "Volume", "Vol.", "Vol", "v", "V" };
-        private static readonly Regex PunctuationPattern = new(@"[^\w\s-&]", RegexOptions.Compiled);
-        private static readonly Regex VolumePattern = new(@"(Vol(?:ume)?\.?)\s*([0-9]+|[IVXLCDM]+)", RegexOptions.IgnoreCase | RegexOptions.Compiled);
-        private static readonly Regex RomanNumeralPattern = new(@"\b([IVXLCDM]+)\b", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+        private static readonly HashSet<string> BlockedSearchTerms = new(StringComparer.OrdinalIgnoreCase)
+        {
+            "beyonce",
+            "jay-z",
+            "Beyoncé",
+            "beyoncè",
+            "gorillaz",
+            "depeche mode",
+            "village people",
+            "chicane",
+            "bryan",
+            "cat power",
+            "lady gaga",
+            "michael jackson",
+            "beatles",
+            "adele",
+            "ymca",
+            "lemonade",
+            "macho man",
+            "in the navy",
+            "purple rain",
+            "rihanna",
+            "weeknd",
+            "kanye west",
+            "kendrick lamar",
+            "frank ocean",
+            "minaj",
+            "linkin park",
+            "paper kingdom",
+            "look outside your window",
+            "housezzz",
+            "from zero",
+            "bryan",
+            "deftones"
+        };
+
+        private static readonly string[][] BlockedTermWords = [.. BlockedSearchTerms
+            .OrderByDescending(t => t.Length)
+            .Select(t => t.Split(' ', StringSplitOptions.RemoveEmptyEntries))];
+
 
         public static string BuildSearchText(string? artist, string? album)
             => string.Join(" ", new[] { album, artist }.Where(term => !string.IsNullOrWhiteSpace(term)).Select(term => term?.Trim()));
@@ -49,10 +87,10 @@ namespace Tubifarry.Indexers.Soulseek
 
         public static bool ShouldGenerateRomanVariations(string album)
         {
-            Match romanMatch = RomanNumeralPattern.Match(album);
+            Match romanMatch = RomanNumeralRegex().Match(album);
             if (!romanMatch.Success) return false;
 
-            Match volumeMatch = VolumePattern.Match(album);
+            Match volumeMatch = VolumeRegex().Match(album);
             return !(volumeMatch.Success && volumeMatch.Groups[2].Value.Equals(romanMatch.Groups[1].Value, StringComparison.OrdinalIgnoreCase));
         }
 
@@ -60,13 +98,24 @@ namespace Tubifarry.Indexers.Soulseek
         {
             if (string.IsNullOrEmpty(input)) return string.Empty;
 
-            string stripped = PunctuationPattern.Replace(input, "");
+            string stripped = PunctuationRegex().Replace(input, "");
             return StripPunctuationRegex().Replace(stripped, " ").Trim();
         }
 
         public static string NormalizeSpecialCharacters(string? input)
         {
             if (string.IsNullOrEmpty(input)) return string.Empty;
+
+            bool isAscii = true;
+            foreach (char c in input)
+            {
+                if (c > 127)
+                {
+                    isAscii = false;
+                    break;
+                }
+            }
+            if (isAscii) return input;
 
             string decomposed = input.Normalize(NormalizationForm.FormD);
             StringBuilder sb = new(decomposed.Length);
@@ -85,7 +134,7 @@ namespace Tubifarry.Indexers.Soulseek
         {
             if (string.IsNullOrEmpty(album)) yield break;
 
-            Match volumeMatch = VolumePattern.Match(album);
+            Match volumeMatch = VolumeRegex().Match(album);
             if (!volumeMatch.Success) yield break;
 
             string volumeFormat = volumeMatch.Groups[1].Value;
@@ -118,15 +167,169 @@ namespace Tubifarry.Indexers.Soulseek
         {
             if (string.IsNullOrEmpty(album)) yield break;
 
-            Match romanMatch = RomanNumeralPattern.Match(album);
+            Match romanMatch = RomanNumeralRegex().Match(album);
             if (!romanMatch.Success) yield break;
-            Match volumeMatch = VolumePattern.Match(album);
+            Match volumeMatch = VolumeRegex().Match(album);
             if (volumeMatch.Success && volumeMatch.Groups[2].Value.Equals(romanMatch.Groups[1].Value, StringComparison.OrdinalIgnoreCase))
                 yield break;
 
             string romanNumeral = romanMatch.Groups[1].Value;
             if (RomanNumerals.TryGetValue(romanNumeral, out int arabicNumber))
                 yield return album.Replace(romanMatch.Value, arabicNumber.ToString());
+        }
+
+        public static string GetMergedDirectoryKey(string directory) =>
+            GetDiscParentKey(directory) ?? GetSiblingDiscKey(directory) ?? directory;
+
+        public static List<IGrouping<string, SlskdFileData>> MergeDiscSubdirectories(IEnumerable<IGrouping<string, SlskdFileData>> directoryGroups)
+        {
+            List<IGrouping<string, SlskdFileData>> groups = [.. directoryGroups];
+            HashSet<string> sharedSiblingKeys = groups
+                .Select(group => GetSiblingDiscKey(group.Key))
+                .OfType<string>()
+                .GroupBy(key => key)
+                .Where(keys => keys.Count() > 1)
+                .Select(keys => keys.Key)
+                .ToHashSet();
+
+            return groups
+                .SelectMany(group => group.Select(file => (Key: GetGroupKey(group.Key, sharedSiblingKeys), File: file)))
+                .GroupBy(x => x.Key, x => x.File)
+                .ToList();
+        }
+
+        private static string GetGroupKey(string directory, HashSet<string> sharedSiblingKeys) =>
+            GetDiscParentKey(directory)
+            ?? (GetSiblingDiscKey(directory) is string siblingKey && sharedSiblingKeys.Contains(siblingKey) ? siblingKey : directory);
+
+        private static string? GetDiscParentKey(string directory)
+        {
+            int separatorIndex = directory.LastIndexOfAny(['\\', '/']);
+            if (separatorIndex <= 0)
+                return null;
+
+            return DiscFolderRegex().IsMatch(directory[(separatorIndex + 1)..].Trim()) ? directory[..separatorIndex] : null;
+        }
+
+        private static string? GetSiblingDiscKey(string directory)
+        {
+            int separatorIndex = directory.LastIndexOfAny(['\\', '/']);
+            if (separatorIndex <= 0)
+                return null;
+
+            Match match = SiblingDiscFolderRegex().Match(directory[(separatorIndex + 1)..].Trim());
+            if (!match.Success)
+                return null;
+
+            string album = match.Groups["album"].Value.TrimEnd(' ', '-', '_', '.', ',', '–', '(', '[', '{');
+            return album.Any(char.IsLetterOrDigit) ? directory[..(separatorIndex + 1)] + album : null;
+        }
+
+        public static string RemoveBlockedTerms(string searchText)
+        {
+            if (string.IsNullOrWhiteSpace(searchText))
+                return string.Empty;
+
+            string[] words = searchText.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+            bool[] removed = new bool[words.Length];
+
+            foreach (string[] termWords in BlockedTermWords)
+            {
+                for (int i = 0; i + termWords.Length <= words.Length; i++)
+                {
+                    bool match = !removed[i];
+                    for (int j = 0; match && j < termWords.Length; j++)
+                        match = !removed[i + j] && string.Equals(words[i + j], termWords[j], StringComparison.OrdinalIgnoreCase);
+                    if (match)
+                        for (int j = 0; j < termWords.Length; j++)
+                            removed[i + j] = true;
+                }
+            }
+
+            return string.Join(' ', words.Where((_, i) => !removed[i]));
+        }
+
+        public static bool ContainsBlockedTerms(string searchText)
+        {
+            if (string.IsNullOrWhiteSpace(searchText))
+                return false;
+
+            string[] words = searchText.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+            return RemoveBlockedTerms(searchText).Split(' ', StringSplitOptions.RemoveEmptyEntries).Length != words.Length;
+        }
+
+        private static readonly Dictionary<char, string> AccentInjectionMap = new()
+        {
+            { 'a', "àáâä" }, { 'A', "ÀÁÂÄ" },
+            { 'e', "èéêë" }, { 'E', "ÈÉÊË" },
+            { 'i', "ìíîï" }, { 'I', "ÌÍÎÏ" },
+            { 'o', "òóôö" }, { 'O', "ÒÓÔÖ" },
+            { 'u', "ùúûü" }, { 'U', "ÙÚÛÜ" },
+            { 'y', "ýÿ" }, { 'Y', "ÝŸ" },
+            { 'c', "çć" }, { 'C', "ÇĆ" },
+            { 'n', "ñń" }, { 'N', "ÑŃ" },
+            { 's', "śş" }, { 'S', "ŚŞ" },
+        };
+
+        public static string RewriteRestrictedTerms(string searchText, int variant = 0)
+        {
+            if (string.IsNullOrWhiteSpace(searchText))
+                return string.Empty;
+
+            string[] words = searchText.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+            string[] normalized = [.. words.Select(NormalizeSpecialCharacters)];
+            bool[] keep = [.. words.Select(_ => true)];
+
+            foreach (string[] termWords in BlockedTermWords)
+                for (int i = 0; i + termWords.Length <= words.Length; i++)
+                {
+                    bool match = true;
+                    for (int j = 0; match && j < termWords.Length; j++)
+                        match = string.Equals(normalized[i + j], termWords[j], StringComparison.OrdinalIgnoreCase);
+                    if (!match)
+                        continue;
+
+                    bool injected = false;
+                    for (int j = 0; j < termWords.Length && !injected; j++)
+                        injected = TryInjectAccent(ref words[i + j], variant);
+
+                    if (!injected)
+                        for (int j = 0; j < termWords.Length; j++)
+                            keep[i + j] = false;
+                }
+
+            return string.Join(' ', words.Where((_, i) => keep[i]));
+        }
+
+        private static bool TryInjectAccent(ref string word, int variant)
+        {
+            for (int c = 0; c < word.Length; c++)
+            {
+                if (AccentInjectionMap.TryGetValue(word[c], out string? variants))
+                {
+                    word = word[..c] + variants[variant % variants.Length] + word[(c + 1)..];
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        public static IEnumerable<string> GetBlockedTermEvidenceTracks(IEnumerable<string> tracks, string? album)
+        {
+            return tracks
+                .Select(CleanEvidenceTitle)
+                .Where(t => t.Length >= 3
+                            && !ContainsBlockedTerms(t)
+                            && !string.Equals(t, album?.Trim(), StringComparison.OrdinalIgnoreCase))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .OrderByDescending(t => t.Length);
+
+            static string CleanEvidenceTitle(string title)
+            {
+                string cleaned = BracketedContentRegex().Replace(title, " ");
+                cleaned = StripPunctuation(cleaned);
+                return cleaned.Trim();
+            }
         }
 
         public static string GetDirectoryFromFilename(string? filename)
@@ -151,5 +354,23 @@ namespace Tubifarry.Indexers.Soulseek
 
         [GeneratedRegex(@"\s+")]
         private static partial Regex StripPunctuationRegex();
+
+        [GeneratedRegex(@"^(cd|disc|disk|dvd)\s*[-_. ]?\s*\d{1,2}$", RegexOptions.IgnoreCase)]
+        private static partial Regex DiscFolderRegex();
+
+        [GeneratedRegex(@"^(?<album>.*?\S)\s*(?:[-_–]\s*)?[\(\[\{]?\s*(?:cd|disc|disk)\s*[-_.#]?\s*\d{1,2}(?:\s*(?:of|/)\s*\d{1,2})?\s*[\)\]\}]?$", RegexOptions.IgnoreCase)]
+        private static partial Regex SiblingDiscFolderRegex();
+
+        [GeneratedRegex(@"[\(\[\{].*?[\)\]\}]")]
+        private static partial Regex BracketedContentRegex();
+
+        [GeneratedRegex(@"[^\w\s-&]")]
+        private static partial Regex PunctuationRegex();
+
+        [GeneratedRegex(@"(Vol(?:ume)?\.?)\s*([0-9]+|[IVXLCDM]+)", RegexOptions.IgnoreCase)]
+        private static partial Regex VolumeRegex();
+
+        [GeneratedRegex(@"\b([IVXLCDM]+)\b", RegexOptions.IgnoreCase)]
+        private static partial Regex RomanNumeralRegex();
     }
 }

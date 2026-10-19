@@ -42,7 +42,16 @@ public static class SlskdStatusResolver
             }
             else if (fs == DownloadItemStatus.Queued)
             {
-                anyActive = true;
+                // Remotely queued files are waiting on the uploader, not on us.
+                // They must NOT count as "active", otherwise the stale-timeout
+                // branches below can never fire (a remotely-queued file would
+                // simultaneously satisfy "all stuck in remote queue" and negate it).
+                bool remotelyQueued = Enum.TryParse(f.State, ignoreCase: true, out TransferStates queuedState)
+                    && queuedState.HasFlag(TransferStates.Queued)
+                    && queuedState.HasFlag(TransferStates.Remotely);
+
+                if (!remotelyQueued)
+                    anyActive = true;
             }
 
             // Inactivity timestamp: max of enqueued / started / (started + elapsed)
@@ -54,17 +63,29 @@ public static class SlskdStatusResolver
             // All-stuck check: short-circuit once one file is NOT stuck
             if (allIncompleteRemoteQueued)
             {
+                // Reference time for "how long has this been waiting": prefer EnqueuedAt,
+                // fall back to RequestedAt. If neither is known (MinValue), the file must
+                // NOT be considered stuck — otherwise a fresh enqueue with a missing
+                // timestamp would be failed instantly.
+                DateTime queuedSince = f.EnqueuedAt != DateTime.MinValue ? f.EnqueuedAt : f.RequestedAt;
                 bool stuckRemote = timeout.HasValue
+                    && queuedSince != DateTime.MinValue
                     && Enum.TryParse<TransferStates>(f.State, ignoreCase: true, out TransferStates ts)
                     && ts.HasFlag(TransferStates.Queued)
                     && ts.HasFlag(TransferStates.Remotely)
-                    && (utcNow - f.EnqueuedAt) > timeout.Value;
+                    && (utcNow - queuedSince) > timeout.Value;
                 if (!stuckRemote)
                     allIncompleteRemoteQueued = false;
             }
         }
 
         bool allStuckInRemoteQueue = anyIncomplete && allIncompleteRemoteQueued;
+
+        bool isStaleTimedOut = !anyActive
+            && anyIncomplete
+            && timeout.HasValue
+            && lastActivity != DateTime.MinValue
+            && (utcNow - lastActivity) > timeout.Value * 2;
 
         int totalFileCount = 0, failedCount = 0, completedCount = 0;
         bool anyWarning = false, anyPaused = false, anyDownloadingState = false;
@@ -95,11 +116,10 @@ public static class SlskdStatusResolver
             status = DownloadItemStatus.Failed;
             message = "All files stuck in remote queue past timeout.";
         }
-        else if (!anyActive && anyIncomplete)
+        else if (isStaleTimedOut)
         {
-            status = timeout.HasValue && (utcNow - lastActivity) > timeout.Value * 2
-                ? DownloadItemStatus.Failed
-                : DownloadItemStatus.Queued;
+            status = DownloadItemStatus.Failed;
+            message = "Download staled out with no progress past timeout.";
         }
         else if (totalFileCount > 0 && (double)failedCount / totalFileCount * 100 > 20)
         {
@@ -111,24 +131,29 @@ public static class SlskdStatusResolver
             status = DownloadItemStatus.Warning;
             message = $"Downloading {failedCount} files failed: {string.Join(", ", failedFileNames)}";
         }
-        else if (totalFileCount > 0 && completedCount == totalFileCount)
-        {
-            status = item.PostProcessTasks.Any(t => !t.IsCompleted)
-                ? DownloadItemStatus.Downloading
-                : DownloadItemStatus.Completed;
-        }
-        else if (anyPaused)
-        {
-            status = DownloadItemStatus.Paused;
-        }
         else if (anyWarning)
         {
             status = DownloadItemStatus.Warning;
             message = "Some files failed. Retrying download...";
         }
+        else if (totalFileCount > 0 && completedCount == totalFileCount)
+        {
+            status = item.PostProcessTasks.Any(t => !t.IsCompleted)
+                ? DownloadItemStatus.Downloading
+                : item.PostProcessError != null ? DownloadItemStatus.Failed : DownloadItemStatus.Completed;
+            message = item.PostProcessError;
+        }
+        else if (anyPaused)
+        {
+            status = DownloadItemStatus.Paused;
+        }
         else if (anyDownloadingState)
         {
             status = DownloadItemStatus.Downloading;
+        }
+        else if (!anyActive && anyIncomplete)
+        {
+            status = DownloadItemStatus.Queued;
         }
         else
         {

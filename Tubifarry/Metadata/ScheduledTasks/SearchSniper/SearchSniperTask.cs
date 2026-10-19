@@ -16,7 +16,6 @@ namespace Tubifarry.Metadata.ScheduledTasks.SearchSniper
     {
         private const int BatchSize = 100;
         private static readonly CacheService _cacheService = new();
-        private readonly IAlbumService _albumService;
         private readonly IArtistService _artistService;
         private readonly IQueueService _queueService;
         private readonly IManageCommandQueue _commandQueueManager;
@@ -25,7 +24,6 @@ namespace Tubifarry.Metadata.ScheduledTasks.SearchSniper
         private readonly Logger _logger;
 
         public SearchSniperTask(
-            IAlbumService albumService,
             IArtistService artistService,
             IQueueService queueService,
             IManageCommandQueue commandQueueManager,
@@ -34,7 +32,6 @@ namespace Tubifarry.Metadata.ScheduledTasks.SearchSniper
             IEventAggregator eventAggregator,
             Logger logger)
         {
-            _albumService = albumService;
             _artistService = artistService;
             _queueService = queueService;
             _commandQueueManager = commandQueueManager;
@@ -52,9 +49,9 @@ namespace Tubifarry.Metadata.ScheduledTasks.SearchSniper
             "Enable this metadata provider to start automatic searches.",
             ProviderMessageType.Info);
 
-        private SearchSniperTaskSettings ActiveSettings => Settings ?? SearchSniperTaskSettings.Instance!;
+        private SearchSniperTaskSettings ActiveSettings => Settings ?? new();
 
-        public override int IntervalMinutes => SearchSniperTaskSettings.Instance!.RefreshInterval;
+        public override int IntervalMinutes => ActiveSettings.RefreshInterval;
 
         public override CommandPriority Priority => CommandPriority.Low;
 
@@ -101,6 +98,8 @@ namespace Tubifarry.Metadata.ScheduledTasks.SearchSniper
 
         private void RunSearch(SearchSniperCommand message)
         {
+            InitializeCache();
+
             if (!ActiveSettings.SearchMissing && !ActiveSettings.SearchMissingTracks && !ActiveSettings.SearchQualityCutoffNotMet)
             {
                 _logger.Warn("No search options enabled. Please enable at least one search criteria.");
@@ -119,19 +118,24 @@ namespace Tubifarry.Metadata.ScheduledTasks.SearchSniper
             }
 
             int targetCount = ActiveSettings.RandomPicksPerInterval;
-            HashSet<int> queuedAlbumIds = GetQueuedAlbumIds();
+            HashSet<int> excludedAlbumIds = GetQueuedAlbumIds();
             int candidateTarget = Math.Min(targetCount * 10, 500);
 
-            List<Album> eligibleAlbums = CollectEligibleAlbums(queuedAlbumIds, candidateTarget);
+            List<Album> selectedAlbums = SelectRandomAlbums(CollectRecentAlbums(excludedAlbumIds, candidateTarget), targetCount);
 
-            if (eligibleAlbums.Count == 0)
+            if (selectedAlbums.Count < targetCount)
+            {
+                excludedAlbumIds.UnionWith(selectedAlbums.Select(a => a.Id));
+                List<Album> eligibleAlbums = CollectEligibleAlbums(excludedAlbumIds, candidateTarget);
+                selectedAlbums.AddRange(SelectRandomAlbums(eligibleAlbums, targetCount - selectedAlbums.Count));
+            }
+
+            if (selectedAlbums.Count == 0)
             {
                 message.SetCompletionMessage("Search Sniper completed. No eligible albums found.");
                 _logger.Info("No eligible albums found after filtering queued and cached albums");
                 return;
             }
-
-            List<Album> selectedAlbums = SelectRandomAlbums(eligibleAlbums, targetCount);
 
             foreach (Album album in selectedAlbums)
                 _logger.Trace("Selected: '{0}' by {1}", album.Title, album.Artist?.Value?.Name ?? "Unknown Artist");
@@ -146,6 +150,21 @@ namespace Tubifarry.Metadata.ScheduledTasks.SearchSniper
             }
         }
 
+        private List<Album> CollectRecentAlbums(HashSet<int> excludedAlbumIds, int candidateTarget)
+        {
+            if (!ActiveSettings.SearchMissing || ActiveSettings.PrioritizeRecentDays <= 0)
+                return [];
+
+            DateTime now = DateTime.UtcNow;
+            List<Album> recentAlbums = _repositoryHelper
+                .GetRecentMissingAlbums(now.AddDays(-ActiveSettings.PrioritizeRecentDays), now, candidateTarget)
+                .Where(a => !excludedAlbumIds.Contains(a.Id) && !IsAlbumCached(a))
+                .ToList();
+
+            _logger.Debug("Collected {0} recent album(s) released within the last {1} day(s)", recentAlbums.Count, ActiveSettings.PrioritizeRecentDays);
+            return recentAlbums;
+        }
+
         private List<Album> CollectEligibleAlbums(HashSet<int> queuedAlbumIds, int candidateTarget)
         {
             Dictionary<int, Album> eligibleAlbums = [];
@@ -156,7 +175,7 @@ namespace Tubifarry.Metadata.ScheduledTasks.SearchSniper
             (int minId, int maxId) cutoffIdRange = (0, 0);
 
             if (ActiveSettings.SearchMissing)
-                missingIdRange = GetMissingAlbumsIdRange();
+                missingIdRange = _repositoryHelper.GetMissingAlbumsIdRange();
 
             if (ActiveSettings.SearchMissingTracks)
                 partialIdRange = _repositoryHelper.GetPartialAlbumsIdRange();
@@ -174,7 +193,7 @@ namespace Tubifarry.Metadata.ScheduledTasks.SearchSniper
                 _logger.Trace("Fetching missing albums (ID range: {0}-{1}, starting at ID: {2})...", missingIdRange.minId, missingIdRange.maxId, startId);
 
                 CollectFromSource(
-                    lastId => GetMissingAlbumsBatch(lastId),
+                    lastId => _repositoryHelper.GetMissingAlbumsBatch(lastId, BatchSize),
                     eligibleAlbums, queuedAlbumIds, candidateTarget, startId, missingIdRange.minId);
             }
 
@@ -310,58 +329,6 @@ namespace Tubifarry.Metadata.ScheduledTasks.SearchSniper
             {
                 if (artistsByMetadataId.TryGetValue(album.ArtistMetadataId, out Artist? artist))
                     album.Artist = new LazyLoaded<Artist>(artist);
-            }
-        }
-
-        private List<Album> GetMissingAlbumsBatch(int lastId)
-        {
-            PagingSpec<Album> pagingSpec = new()
-            {
-                Page = 1,
-                PageSize = BatchSize,
-                SortDirection = SortDirection.Ascending,
-                SortKey = "Id"
-            };
-
-            pagingSpec.FilterExpressions.Add(v => v.Id > lastId);
-            pagingSpec.FilterExpressions.Add(v => v.Monitored == true && v.Artist.Value.Monitored == true);
-
-            return _albumService.AlbumsWithoutFiles(pagingSpec).Records;
-        }
-
-        private (int minId, int maxId) GetMissingAlbumsIdRange()
-        {
-            try
-            {
-                PagingSpec<Album> minSpec = new()
-                {
-                    Page = 1,
-                    PageSize = 1,
-                    SortDirection = SortDirection.Ascending,
-                    SortKey = "Id"
-                };
-                minSpec.FilterExpressions.Add(v => v.Monitored == true && v.Artist.Value.Monitored == true);
-                List<Album> minResult = _albumService.AlbumsWithoutFiles(minSpec).Records;
-
-                if (minResult.Count == 0)
-                    return (0, 0);
-
-                PagingSpec<Album> maxSpec = new()
-                {
-                    Page = 1,
-                    PageSize = 1,
-                    SortDirection = SortDirection.Descending,
-                    SortKey = "Id"
-                };
-                maxSpec.FilterExpressions.Add(v => v.Monitored == true && v.Artist.Value.Monitored == true);
-                List<Album> maxResult = _albumService.AlbumsWithoutFiles(maxSpec).Records;
-
-                return (minResult[0].Id, maxResult.Count > 0 ? maxResult[0].Id : minResult[0].Id);
-            }
-            catch (Exception ex)
-            {
-                _logger.Error(ex, "Error getting missing albums ID range");
-                return (0, 0);
             }
         }
 

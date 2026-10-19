@@ -3,6 +3,7 @@ using NLog;
 using NzbDrone.Common.Disk;
 using NzbDrone.Core.Download;
 using NzbDrone.Core.Download.TrackedDownloads;
+using NzbDrone.Core.Extras.Metadata;
 using NzbDrone.Core.History;
 using NzbDrone.Core.Indexers;
 using NzbDrone.Core.MediaFiles;
@@ -13,8 +14,10 @@ using NzbDrone.Core.Notifications;
 using NzbDrone.Core.Organizer;
 using NzbDrone.Core.Parser.Model;
 using NzbDrone.Core.ThingiProvider;
+using System.Collections.Concurrent;
 using System.IO.Abstractions;
 using Tubifarry.Core.Utilities;
+using Tubifarry.Metadata.Beets;
 using Tubifarry.Notifications.Queue;
 
 namespace Tubifarry.Notifications.QueueCleaner
@@ -28,6 +31,12 @@ namespace Tubifarry.Notifications.QueueCleaner
         private readonly IEventAggregator _eventAggregator;
         private readonly INamingConfigService _namingConfig;
         private readonly IIndexerFactory _indexerFactory;
+        private readonly IMetadataFactory _metadataFactory;
+        private readonly IReleaseService _releaseService;
+        private readonly IBeetsService _beetsService;
+
+        private static readonly TimeSpan BeetsRetagTimeout = TimeSpan.FromMinutes(15);
+        private static readonly ConcurrentDictionary<string, byte> BeetsRetagged = new(StringComparer.Ordinal);
 
         public override string Name => "Queue Cleaner";
 
@@ -35,8 +44,11 @@ namespace Tubifarry.Notifications.QueueCleaner
 
         public override ProviderMessage Message => new("Queue Cleaner automatically processes items that failed to import. It can rename, blocklist, or remove items based on your settings.", ProviderMessageType.Info);
 
-        public QueueCleaner(IDiskProvider diskProvider, IHistoryService historyService, INamingConfigService namingConfig, IEventAggregator eventAggregator, IIndexerFactory indexerFactory, ICompletedDownloadService completedDownloadService, Logger logger)
+        public QueueCleaner(IDiskProvider diskProvider, IHistoryService historyService, INamingConfigService namingConfig, IEventAggregator eventAggregator, IIndexerFactory indexerFactory, ICompletedDownloadService completedDownloadService, IMetadataFactory metadataFactory, IReleaseService releaseService, IBeetsService beetsService, Logger logger)
         {
+            _metadataFactory = metadataFactory;
+            _releaseService = releaseService;
+            _beetsService = beetsService;
             _logger = logger;
             _indexerFactory = indexerFactory;
             _diskProvider = diskProvider;
@@ -120,7 +132,13 @@ namespace Tubifarry.Notifications.QueueCleaner
             if (importCleaningOption != (int)requiredOption && importCleaningOption != (int)ImportCleaningOptions.Always)
                 return;
 
-            if (Settings.RenameOption != (int)RenameOptions.DoNotRename && Rename(trackedDownload))
+            bool changed = Settings.RetagWithBeets && RetagWithBeets(trackedDownload);
+            changed |= Settings.FillMissingTags && FillMissingTags(trackedDownload);
+
+            if (Settings.RenameOption != (int)RenameOptions.DoNotRename)
+                changed |= Rename(trackedDownload);
+
+            if (changed)
             {
                 Retry(trackedDownload);
                 return;
@@ -166,11 +184,227 @@ namespace Tubifarry.Notifications.QueueCleaner
                 return false;
             }
 
+            bool folderRenamed = TryRenameFolder(item, ref downloadPath);
+
             List<IFileInfo> filesOnDisk = [.. _diskProvider.GetFileInfos(downloadPath, true)];
             HashSet<string> audioExtensions = new(MediaFileExtensions.Extensions, StringComparer.OrdinalIgnoreCase);
             ReleaseFormatter releaseFormatter = new(item.RemoteAlbum.Release, item.RemoteAlbum.Artist, _namingConfig.GetConfig());
 
-            return filesOnDisk.Any(file => TryRenameFile(file, audioExtensions, releaseFormatter, filesOnDisk));
+            bool anyFileRenamed = filesOnDisk.Any(file => TryRenameFile(file, audioExtensions, releaseFormatter, filesOnDisk));
+            return folderRenamed || anyFileRenamed;
+        }
+
+        private bool RetagWithBeets(TrackedDownload item)
+        {
+            Album? album = item.RemoteAlbum?.Albums?.Count == 1 ? item.RemoteAlbum.Albums[0] : null;
+            BeetsSettings? beets = _metadataFactory.GetEnabledBeetsSettings();
+
+            if (BeetsRetagged.ContainsKey(item.DownloadItem.DownloadId))
+            {
+                _logger.Debug("Skipping beets retag for '{0}': it was already retagged once", item.DownloadItem.Title);
+                return false;
+            }
+
+            if (album == null || beets == null)
+            {
+                _logger.Debug("Skipping beets retag for '{0}': {1}", item.DownloadItem.Title, beets == null ? "the Beets metadata provider is not enabled" : "the download does not belong to exactly one album");
+                return false;
+            }
+
+            List<AlbumRelease> releases = _releaseService.GetReleasesByAlbum(album.Id)
+                .Where(r => !string.IsNullOrWhiteSpace(r.ForeignReleaseId))
+                .OrderByDescending(r => r.Monitored)
+                .ToList();
+
+            if (releases.Count == 0)
+            {
+                _logger.Debug("Skipping beets retag for '{0}': the album has no releases", item.DownloadItem.Title);
+                return false;
+            }
+
+            try
+            {
+                using CancellationTokenSource timeout = new(BeetsRetagTimeout);
+                string path = (item.ImportItem ?? item.DownloadItem).OutputPath.FullPath;
+                BeetsRetagResult result = _beetsService.RetagAsync(beets, path, releases.Select(r => new BeetsReleaseCandidate(r.ForeignReleaseId, r.TrackCount)).ToList(), timeout.Token).GetAwaiter().GetResult();
+                AlbumRelease? matched = releases.Find(r => string.Equals(r.ForeignReleaseId, result.ReleaseId, StringComparison.OrdinalIgnoreCase));
+
+                if (result.Hardlinked)
+                {
+                    _logger.Info("beets did not retag '{0}': the files are hardlinked", item.DownloadItem.Title);
+                    return false;
+                }
+
+                if (result.Retagged == 0 || matched == null)
+                {
+                    _logger.Info("beets found no confident match of '{0}' among the {1} release(s) of '{2}' ({3} of {4} file(s) confirmed by fingerprint)", item.DownloadItem.Title, releases.Count, album.Title, result.Fingerprinted, result.Files);
+                    return false;
+                }
+
+                BeetsRetagged.TryAdd(item.DownloadItem.DownloadId, 0);
+                _logger.Info("beets retagged {0} of {1} track(s) of '{2}' as release '{3}' ({4}, {5} tracks){6}", result.Retagged, result.Files, item.DownloadItem.Title, matched.Title, matched.ForeignReleaseId, matched.TrackCount, result.Pinned ? ", every file confirmed by fingerprint" : string.Empty);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                _logger.Warn(ex, "beets retag of '{0}' failed", item.DownloadItem.Title);
+                return false;
+            }
+        }
+
+        private bool FillMissingTags(TrackedDownload item)
+        {
+            Artist? artist = item.RemoteAlbum?.Artist;
+            Album? album = item.RemoteAlbum?.Albums?.Count == 1 ? item.RemoteAlbum.Albums[0] : null;
+            if (artist == null && album == null)
+                return false;
+
+            string downloadPath = item.DownloadItem.OutputPath.FullPath;
+            bool anyChanged = false;
+
+            IFileInfo[] audioFiles = GetAudioFiles(downloadPath);
+            bool mbidsConsistent = AreExistingMbidsConsistent(audioFiles, album?.ForeignAlbumId, artist?.ForeignArtistId);
+
+            foreach (IFileInfo file in audioFiles)
+            {
+                try
+                {
+                    TagLib.File fileTags = TagLib.File.Create(file.FullName);
+                    TagLib.Tag tag = fileTags.Tag;
+
+                    string existingArtist = tag.FirstAlbumArtist ?? tag.FirstPerformer ?? string.Empty;
+                    string existingAlbum = tag.Album ?? string.Empty;
+
+                    bool artistCorroborated = artist != null && existingArtist.Length > 0 &&
+                        FuzzySharp.Fuzz.Ratio(existingArtist.ToLowerInvariant(), artist.Name.ToLowerInvariant()) > 85;
+                    bool albumCorroborated = album != null && existingAlbum.Length > 0 &&
+                        FuzzySharp.Fuzz.Ratio(existingAlbum.ToLowerInvariant(), album.Title.ToLowerInvariant()) > 85;
+
+                    if (!artistCorroborated && !albumCorroborated)
+                        continue;
+
+                    bool changed = false;
+
+                    if (albumCorroborated && artist != null && existingArtist.Length == 0)
+                    {
+                        tag.AlbumArtists = [artist.Name];
+                        changed = true;
+                    }
+
+                    if (artistCorroborated && album != null && existingAlbum.Length == 0)
+                    {
+                        tag.Album = album.Title;
+                        changed = true;
+                    }
+
+                    if (artistCorroborated && albumCorroborated)
+                    {
+                        if (tag.Year == 0 && album!.ReleaseDate.HasValue)
+                        {
+                            tag.Year = (uint)album.ReleaseDate.Value.Year;
+                            changed = true;
+                        }
+
+                        if (mbidsConsistent)
+                        {
+                            if (string.IsNullOrEmpty(tag.MusicBrainzReleaseGroupId) && !string.IsNullOrEmpty(album!.ForeignAlbumId))
+                            {
+                                tag.MusicBrainzReleaseGroupId = album.ForeignAlbumId;
+                                changed = true;
+                            }
+
+                            if (string.IsNullOrEmpty(tag.MusicBrainzArtistId) && !string.IsNullOrEmpty(artist!.ForeignArtistId))
+                            {
+                                tag.MusicBrainzArtistId = artist.ForeignArtistId;
+                                changed = true;
+                            }
+                        }
+                    }
+
+                    if (changed)
+                    {
+                        fileTags.Save();
+                        anyChanged = true;
+                        _logger.Debug($"Filled missing tags for: {file.Name}");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.Trace(ex, $"Could not read/write tags for {file.FullName}");
+                }
+            }
+
+            return anyChanged;
+        }
+
+        private static bool AreExistingMbidsConsistent(IFileInfo[] audioFiles, string? albumGroupId, string? artistId)
+        {
+            foreach (IFileInfo file in audioFiles)
+            {
+                try
+                {
+                    TagLib.Tag tag = TagLib.File.Create(file.FullName).Tag;
+
+                    if (!string.IsNullOrEmpty(tag.MusicBrainzReleaseGroupId) &&
+                        !tag.MusicBrainzReleaseGroupId.Equals(albumGroupId, StringComparison.OrdinalIgnoreCase))
+                        return false;
+
+                    if (!string.IsNullOrEmpty(tag.MusicBrainzArtistId) &&
+                        !tag.MusicBrainzArtistId.Equals(artistId, StringComparison.OrdinalIgnoreCase))
+                        return false;
+
+                    if (!string.IsNullOrEmpty(tag.MusicBrainzReleaseId))
+                        return false;
+                }
+                catch
+                {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
+        private bool TryRenameFolder(TrackedDownload item, ref string downloadPath)
+        {
+            try
+            {
+                IFileInfo? firstAudio = GetAudioFiles(downloadPath).FirstOrDefault();
+                if (firstAudio == null)
+                    return false;
+
+                TagLib.File fileTags = TagLib.File.Create(firstAudio.FullName);
+                string? artist = fileTags.Tag.FirstAlbumArtist ?? fileTags.Tag.FirstPerformer;
+                string? album = fileTags.Tag.Album;
+                uint year = fileTags.Tag.Year;
+
+                if (string.IsNullOrWhiteSpace(artist) || string.IsNullOrWhiteSpace(album))
+                    return false;
+
+                string newLeaf = year > 0 ? $"{artist} - {album} ({year})" : $"{artist} - {album}";
+                newLeaf = string.Concat(newLeaf.Split(Path.GetInvalidFileNameChars())).Trim();
+
+                string? parent = Path.GetDirectoryName(downloadPath.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
+                string currentLeaf = Path.GetFileName(downloadPath.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
+
+                if (parent == null || newLeaf.Length == 0 || newLeaf.Equals(currentLeaf, StringComparison.OrdinalIgnoreCase))
+                    return false;
+
+                string newPath = Path.Combine(parent, newLeaf);
+                if (_diskProvider.FolderExists(newPath))
+                    return false;
+
+                _diskProvider.MoveFolder(downloadPath, newPath);
+                item.DownloadItem.OutputPath = new OsPath(newPath);
+                downloadPath = newPath;
+                _logger.Info($"Renamed download folder from tags: '{currentLeaf}' -> '{newLeaf}'");
+                return true;
+            }
+            catch (Exception ex)
+            {
+                _logger.Error(ex, $"Failed to rename download folder: {downloadPath}");
+                return false;
+            }
         }
 
         private bool TryRenameFile(IFileInfo file, HashSet<string> audioExtensions, ReleaseFormatter releaseFormatter, List<IFileInfo> filesOnDisk)
@@ -188,6 +422,7 @@ namespace Tubifarry.Notifications.QueueCleaner
                 TagLib.File fileTags = TagLib.File.Create(filePath);
                 string artistName = fileTags.Tag.FirstAlbumArtist ?? fileTags.Tag.FirstPerformer ?? "UnknownArtist";
                 string title = fileTags.Tag.Title ?? Path.GetFileNameWithoutExtension(filePath);
+                string albumTitle = fileTags.Tag.Album ?? title;
                 string trackNumber = fileTags.Tag.Track.ToString("D2");
 
                 string newFileNameWithoutExtension = releaseFormatter.BuildTrackFilename(null, new Track
@@ -195,7 +430,7 @@ namespace Tubifarry.Notifications.QueueCleaner
                     Title = title,
                     TrackNumber = trackNumber,
                     Artist = new Artist { Name = artistName }
-                }, new Album { Title = title });
+                }, new Album { Title = albumTitle });
 
                 string newFileName = $"{newFileNameWithoutExtension}{Path.GetExtension(filePath)}";
                 string newFilePath = Path.Combine(directory, newFileName);
@@ -236,6 +471,12 @@ namespace Tubifarry.Notifications.QueueCleaner
             item.State = TrackedDownloadState.DownloadFailed;
 
             List<EntityHistory> grabbedItems = [.. _historyService.Find(item.DownloadItem.DownloadId, EntityHistoryEventType.Grabbed)];
+            if (grabbedItems.Count == 0)
+            {
+                _logger.Debug($"No grab history found for '{item.DownloadItem.Title}'; cannot blocklist.");
+                return;
+            }
+
             EntityHistory historyItem = grabbedItems[^1];
 
             _ = Enum.TryParse(historyItem.Data.GetValueOrDefault(EntityHistory.RELEASE_SOURCE, nameof(ReleaseSourceType.Unknown)), out ReleaseSourceType releaseSource);
@@ -269,10 +510,16 @@ namespace Tubifarry.Notifications.QueueCleaner
                 return ImportFailureReason.DidNotFail;
 
             bool hasMissingTracks = trackedDownload.StatusMessages
-                .Any(sm => sm.Messages.Any(m => m.Contains("Has missing tracks", StringComparison.OrdinalIgnoreCase)));
+                .Any(sm => sm.Messages.Any(m =>
+                    m.Contains("Has missing tracks", StringComparison.OrdinalIgnoreCase) ||
+                    m.Contains("fewer tracks than existing release", StringComparison.OrdinalIgnoreCase)));
 
             bool hasInsufficientInformation = trackedDownload.StatusMessages
-                .Any(sm => sm.Messages.Any(m => m.Contains("Album match is not close enough", StringComparison.OrdinalIgnoreCase)));
+                .Any(sm => sm.Messages.Any(m =>
+                    m.Contains("Album match is not close enough", StringComparison.OrdinalIgnoreCase) ||
+                    m.Contains("Couldn't find similar album", StringComparison.OrdinalIgnoreCase) ||
+                    m.Contains("Has unmatched tracks", StringComparison.OrdinalIgnoreCase) ||
+                    m.Contains("Worst track match", StringComparison.OrdinalIgnoreCase)));
 
             return (hasMissingTracks, hasInsufficientInformation) switch
             {
@@ -288,6 +535,10 @@ namespace Tubifarry.Notifications.QueueCleaner
         public override ValidationResult Test()
         {
             ValidationResult result = new();
+
+            if (Settings.RetagWithBeets && _metadataFactory.GetEnabledBeetsSettings() == null)
+                result.Errors.Add(new ValidationFailure(nameof(Settings.RetagWithBeets), "Retag With Beets needs an enabled Beets metadata provider (Settings → Metadata)."));
+
             IEnumerable<string> validProviders = _indexerFactory.GetAvailableProviders().Select(x => x.Name);
 
             if (Settings.Indexers?.Any() == true)

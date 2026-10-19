@@ -39,23 +39,6 @@ namespace Tubifarry.Indexers.Soulseek
             _indexerRequestGenerator = new SlskdRequestGenerator(this, slskdSearchChain, httpClient, sentry);
         }
 
-        protected override IList<ReleaseInfo> CleanupReleases(IEnumerable<ReleaseInfo> releases, bool isRecent = false)
-        {
-            IList<ReleaseInfo> result = base.CleanupReleases(releases, isRecent);
-
-            foreach (ReleaseInfo release in result)
-            {
-                if (release is not TorrentInfo slskd)
-                    continue;
-
-                int basePriority = release.IndexerPriority;
-                int score = Math.Clamp(slskd.Seeders ?? 0, 0, 10000);
-                release.IndexerPriority = basePriority + 12 - (int)Math.Round(score / 10000.0 * 24);
-            }
-
-            return result;
-        }
-
         protected override async Task Test(List<ValidationFailure> failures) => failures.AddIfNotNull(await TestConnection());
 
         public override IIndexerRequestGenerator<LazyIndexerPageableRequest> GetExtendedRequestGenerator() => _indexerRequestGenerator;
@@ -66,8 +49,11 @@ namespace Tubifarry.Indexers.Soulseek
         {
             try
             {
-                HttpRequest request = new HttpRequestBuilder($"{Settings.BaseUrl}/api/v0/application")
-                    .SetHeader("X-API-KEY", Settings.ApiKey).Build();
+                HttpRequestBuilder builder = new HttpRequestBuilder($"{Settings.BaseUrl}/api/v0/application");
+                if (!string.IsNullOrWhiteSpace(Settings.ApiKey))
+                    builder.SetHeader("X-API-KEY", Settings.ApiKey);
+
+                HttpRequest request = builder.Build();
                 request.AllowAutoRedirect = true;
                 request.RequestTimeout = TimeSpan.FromSeconds(30);
                 HttpResponse response = await _httpClient.ExecuteAsync(request);
@@ -92,6 +78,12 @@ namespace Tubifarry.Indexers.Soulseek
                     return PermissionTester.TestReadWritePermissions(Path.GetDirectoryName(Settings.IgnoreListPath)!, _logger)!;
                 }
                 return null!;
+            }
+            catch (HttpException ex) when (ex.Response.StatusCode == HttpStatusCode.Unauthorized)
+            {
+                return new ValidationFailure("ApiKey", string.IsNullOrWhiteSpace(Settings.ApiKey)
+                    ? "API Key is required."
+                    : "API Key is wrong.");
             }
             catch (HttpException ex)
             {

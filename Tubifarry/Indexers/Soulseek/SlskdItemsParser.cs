@@ -1,5 +1,5 @@
 using FuzzySharp;
-using Newtonsoft.Json;
+using System.Text.Json;
 using NLog;
 using NzbDrone.Core.Indexers;
 using System.Collections.Concurrent;
@@ -38,10 +38,27 @@ namespace Tubifarry.Indexers.Soulseek
             { 'C', 100 }, { 'D', 500 }, { 'M', 1000 }
         };
 
-        private static readonly string[] _nonArtistFolders =
+        private static readonly HashSet<string> _nonArtistFolders = new(StringComparer.OrdinalIgnoreCase)
+        {
+            "audio", "compilations", "soundtracks",
+            "pop", "rock", "jazz", "classical", "various",
+            "torrents", "albums", "album", "recordings",
+            "my music", "mymusic", "new music", "saved music",
+            "muziek", "musiques", "muzika",
+            "deezer", "deezloader", "spotify", "beets",
+            "single", "singles", "ep", "eps", "lp", "lps",
+            "demo", "demos", "live", "remix", "remixes",
+            "bootleg", "bootlegs", "mixtape", "mixtapes",
+            "promo", "promos", "discography", "features",
+            "appearances", "extras", "other", "rarities",
+            "outtakes", "unreleased", "b-sides", "loosies"
+        };
+
+        private static readonly string[] _nonArtistStems =
         [
-            "music", "mp3", "flac", "audio", "compilations", "soundtracks",
-            "pop", "rock", "jazz", "classical", "various", "downloads"
+            "music", "share", "complete", "download", "soulseek",
+            "library", "collection", "sorted", "unsorted",
+            "misc", "upload", "media"
         ];
 
         public SlskdItemsParser(ISentryHelper sentry, Logger logger)
@@ -52,7 +69,9 @@ namespace Tubifarry.Indexers.Soulseek
 
         public SlskdFolderData ParseFolderName(string folderPath)
         {
-            string[] pathComponents = SplitPathIntoComponents(folderPath);
+            string[] rawComponents = SplitPathIntoComponents(folderPath);
+            string[] pathComponents = rawComponents.Length > 1 ? rawComponents[1..] : rawComponents;
+
             (string? artist, string? album, string? year) = ParseFromRegexPatterns(pathComponents);
 
             if (string.IsNullOrEmpty(artist) && pathComponents.Length >= 2)
@@ -102,17 +121,44 @@ namespace Tubifarry.Indexers.Soulseek
                 isAlbumMatch = combinedPartial > FuzzyCombinedThreshold;
             }
 
-            _logger.Debug($"Match results - Artist: {isArtistMatch}, Album: {isAlbumMatch}");
+            // Path-tail match: album name often sits in the parent
+            if (!isAlbumMatch && !string.IsNullOrEmpty(searchAlbumNorm))
+            {
+                string[] components = SplitPathIntoComponents(directory.Key);
+                if (components.Length >= 2)
+                {
+                    string pathTailNorm = NormalizeString($"{components[^2]} {components[^1]}");
+                    (int tailPartial, int tailTokenSort) = GetCachedFuzzyScores(pathTailNorm, searchAlbumNorm);
+                    isAlbumMatch = tailPartial > FuzzyAlbumPartialThreshold || tailTokenSort > FuzzyAlbumTokenSortThreshold;
+                }
+            }
+
+            double trackEvidence = CalculateTrackTitleEvidence(directory, searchData.Tracks);
+            if (trackEvidence >= 0.35)
+                isAlbumMatch = true;
+
+            _logger.Debug($"Match results - Artist: {isArtistMatch}, Album: {isAlbumMatch}, TrackEvidence: {trackEvidence:P0}");
 
             // Determine final values for artist, album, year
             string finalArtist = DetermineFinalArtist(isArtistMatch, folderData, searchData);
             string finalAlbum = DetermineFinalAlbum(isAlbumMatch, folderData, searchData);
+            string sourceTag = DetectSourceTag(folderData.Path);
+            List<string> releaseTags = ExtractReleaseTags(folderData.Path);
             string finalYear = folderData.Year;
 
             (AudioFormat Codec, int? BitRate, int? BitDepth, int? SampleRate, long TotalSize, int TotalDuration) = AnalyzeAudioQuality(directory);
             string qualityInfo = FormatQualityInfo(Codec, BitRate, BitDepth, SampleRate);
 
-            List<SlskdFileData>? filesToDownload = directory.GroupBy(f => f.Filename?[..f.Filename.LastIndexOf('\\')]).FirstOrDefault(g => g.Key == directory.Key)?.ToList();
+            List<SlskdFileData>? filesToDownload = [.. directory
+                .Where(f =>
+                {
+                    int separatorIndex = f.Filename?.LastIndexOf('\\') ?? -1;
+                    if (separatorIndex <= 0)
+                        return false;
+
+                    string parent = f.Filename![..separatorIndex];
+                    return parent == directory.Key || SlskdTextProcessor.GetMergedDirectoryKey(parent) == directory.Key;
+                })];
             int actualTrackCount = filesToDownload?.Count ?? 0;
 
             _logger.Trace($"Audio: {Codec}, BitRate: {BitRate}, BitDepth: {BitDepth}, Files: {actualTrackCount}");
@@ -121,6 +167,24 @@ namespace Tubifarry.Indexers.Soulseek
             string? edition = ExtractEdition(folderData.Path)?.ToUpper();
 
             int priority = folderData.CalculatePriority(expectedTrackCount);
+            priority += (int)(trackEvidence * 400);
+
+            double durationMatch = CalculateDurationMatch(directory, searchData.TrackDurations);
+            if (durationMatch >= 0)
+            {
+                if (durationMatch >= 0.8)
+                    priority += (int)(durationMatch * 400);
+                else if (durationMatch < 0.5)
+                    priority = (int)(priority * (0.5 + durationMatch));
+            }
+
+            if (HasTrackNumberGaps(directory))
+                priority /= 2;
+            if (!isAlbumMatch)
+                priority = (int)(priority * 0.35);
+            if (!isArtistMatch)
+                priority = (int)(priority * 0.7);
+            priority = Math.Clamp(priority, 0, 10000);
 
             string regexMatchType = DetermineRegexMatchType(folderData.Path);
             List<string>? directoryFiles = filesToDownload?.Select(f => f.Filename ?? "").Where(f => !string.IsNullOrEmpty(f)).ToList();
@@ -147,6 +211,7 @@ namespace Tubifarry.Indexers.Soulseek
 
             return new AlbumData("Slskd", nameof(SoulseekDownloadProtocol))
             {
+                Guid = $"Slskd-{folderData.Username}-{folderData.Path}-{Codec}-{BitRate}-{BitDepth}",
                 AlbumId = $"/api/v0/transfers/downloads/{folderData.Username}",
                 ArtistName = finalArtist,
                 AlbumName = finalAlbum,
@@ -156,6 +221,7 @@ namespace Tubifarry.Indexers.Soulseek
                     : new DateTime(yearInt, 1, 1),
                 Codec = Codec,
                 BitDepth = BitDepth ?? 0,
+                SampleRate = SampleRate ?? 0,
                 Bitrate = (Codec == AudioFormat.MP3
                           ? AudioFormatHelper.RoundToStandardBitrate(BitRate ?? 0)
                           : BitRate) ?? 0,
@@ -163,8 +229,10 @@ namespace Tubifarry.Indexers.Soulseek
                 InfoUrl = infoUrl,
                 ExplicitContent = ExtractExplicitTag(folderData.Path),
                 Priotity = priority,
-                CustomString = JsonConvert.SerializeObject(filesToDownload),
-                ExtraInfo = [edition, $"👤 {folderData.Username} ", $"{(folderData.HasFreeUploadSlot ? "⚡" : "❌")} {folderData.UploadSpeed / 1024.0 / 1024.0:F2}MB/s ", folderData.QueueLength == 0 ? "" : $"📋 {folderData.QueueLength}"],
+                ShowPriorityInTitle = settings?.ShowPriorityInTitle ?? false,
+                SourceTag = sourceTag,
+                CustomString = JsonSerializer.Serialize(filesToDownload),
+                ExtraInfo = [edition, .. releaseTags.Where(t => !string.Equals(t, edition, StringComparison.OrdinalIgnoreCase)), $"👤 {folderData.Username} ", $"{(folderData.HasFreeUploadSlot ? "⚡" : "❌")} {folderData.UploadSpeed / 1024.0 / 1024.0:F2}MB/s ", folderData.QueueLength == 0 ? "" : $"📋 {folderData.QueueLength}"],
                 Duration = TotalDuration
             };
         }
@@ -182,10 +250,14 @@ namespace Tubifarry.Indexers.Soulseek
             Match? match = TryMatchRegex(lastComponent, ArtistAlbumYearRegex());
             if (match != null)
             {
-                return (
-                    match.Groups["artist"].Success ? match.Groups["artist"].Value.Trim() : null,
-                    match.Groups["album"].Success ? match.Groups["album"].Value.Trim() : null,
-                    match.Groups["year"].Success ? match.Groups["year"].Value.Trim() : null);
+                string? artist = match.Groups["artist"].Success ? match.Groups["artist"].Value.Trim() : null;
+                if (!IsYearString(artist))
+                {
+                    return (
+                        artist,
+                        match.Groups["album"].Success ? match.Groups["album"].Value.Trim() : null,
+                        match.Groups["year"].Success ? match.Groups["year"].Value.Trim() : null);
+                }
             }
 
             // Try year-artist-album pattern
@@ -196,6 +268,26 @@ namespace Tubifarry.Indexers.Soulseek
                     match.Groups["artist"].Success ? match.Groups["artist"].Value.Trim() : null,
                     match.Groups["album"].Success ? match.Groups["album"].Value.Trim() : null,
                     match.Groups["year"].Success ? match.Groups["year"].Value.Trim() : null);
+            }
+
+            // Try artist-year-album pattern
+            match = TryMatchRegex(lastComponent, ArtistYearAlbumRegex());
+            if (match?.Groups["album"].Success == true)
+            {
+                return (
+                    match.Groups["artist"].Value.Trim(),
+                    CleanComponent(match.Groups["album"].Value),
+                    match.Groups["year"].Value.Trim());
+            }
+
+            // Try leading-year pattern
+            match = TryMatchRegex(lastComponent, LeadingYearAlbumRegex());
+            if (match?.Groups["album"].Success == true)
+            {
+                return (
+                    GetArtistFromParentFolder(pathComponents),
+                    CleanComponent(match.Groups["album"].Value),
+                    match.Groups["year"].Value.Trim());
             }
 
             // Try album-year pattern
@@ -217,11 +309,61 @@ namespace Tubifarry.Indexers.Soulseek
         private static string? GetArtistFromParentFolder(string[] pathComponents)
         {
             if (pathComponents.Length < 2) return null;
-            string parentFolder = pathComponents[^2];
-            if (!_nonArtistFolders.Contains(parentFolder.ToLowerInvariant()))
-                return parentFolder;
+
+            for (int i = pathComponents.Length - 2; i >= 0; i--)
+            {
+                string folder = pathComponents[i];
+                if (IsNonArtistFolder(folder))
+                    continue;
+                return CleanArtistFolderName(folder);
+            }
 
             return null;
+        }
+
+        private static string CleanArtistFolderName(string name)
+        {
+            string cleaned = TrailingParenthesizedRegex().Replace(name, "").Trim();
+            return cleaned.Length >= 2 ? cleaned : name;
+        }
+
+        private static bool IsYearString(string? value)
+        {
+            if (value is not { Length: 4 })
+                return false;
+            Match m = YearExtractionRegex().Match(value);
+            return m.Success && m.Index == 0 && m.Length == value.Length;
+        }
+
+        private static bool IsNonArtistFolder(string name)
+        {
+            if (string.IsNullOrWhiteSpace(name))
+                return true;
+
+            if (_nonArtistFolders.Contains(name))
+                return true;
+
+            string lettersOnly = RemoveNonAlphanumericRegex().Replace(name, "").ToLowerInvariant();
+            if (lettersOnly.Length > 0 && _nonArtistStems.Any(stem => lettersOnly.StartsWith(stem, StringComparison.Ordinal)))
+                return true;
+
+            if (IsQualityBucketFolder(name))
+                return true;
+
+            if (NumberedCategoryRegex().IsMatch(name))
+                return true;
+
+            return false;
+        }
+
+        private static bool IsQualityBucketFolder(string name)
+        {
+            foreach (string word in name.Split([' ', '_', '-'], StringSplitOptions.RemoveEmptyEntries))
+            {
+                if (AudioFormatHelper.GetAudioCodecFromExtension(word) != AudioFormat.Unknown)
+                    return true;
+            }
+            return false;
         }
 
         private bool CheckVolumeSeriesMatch(string directoryPath, string? searchAlbum)
@@ -428,6 +570,12 @@ namespace Tubifarry.Indexers.Soulseek
             if (TryMatchRegex(lastComponent, YearArtistAlbumRegex()) != null)
                 return "YearArtistAlbum";
 
+            if (TryMatchRegex(lastComponent, ArtistYearAlbumRegex()) != null)
+                return "ArtistYearAlbum";
+
+            if (TryMatchRegex(lastComponent, LeadingYearAlbumRegex()) != null)
+                return "LeadingYearAlbum";
+
             if (TryMatchRegex(lastComponent, AlbumYearRegex()) != null)
                 return "AlbumYear";
 
@@ -452,8 +600,139 @@ namespace Tubifarry.Indexers.Soulseek
                 return folderVersion.Success && !searchVersion.Success ? $"{searchData.Album} {folderVersion.Value}" : searchData.Album;
             }
             if (!string.IsNullOrEmpty(folderData.Album))
-                return folderData.Album;
+                return CleanFallbackAlbum(folderData.Album, searchData.Artist);
             return searchData.Album ?? "Unknown Album";
+        }
+
+        private static string CleanFallbackAlbum(string album, string? artist)
+        {
+            string cleaned = JunkTokenRegex().Replace(album, " ");
+
+            string normArtist = string.IsNullOrEmpty(artist) ? string.Empty : NormalizeString(artist);
+            if (normArtist.Length > 2)
+            {
+                string[] words = cleaned.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+                string[] artistWords = normArtist.Split(' ');
+                List<string> output = [];
+                int i = 0;
+                while (i < words.Length)
+                {
+                    if (i + artistWords.Length <= words.Length &&
+                        NormalizeString(string.Join(' ', words[i..(i + artistWords.Length)])) == normArtist)
+                    {
+                        i += artistWords.Length;
+                        continue;
+                    }
+                    output.Add(words[i]);
+                    i++;
+                }
+                if (output.Count > 0)
+                    cleaned = string.Join(' ', output);
+            }
+
+            cleaned = ReduceWhitespaceRegex().Replace(cleaned, " ").Trim(' ', '-', ':', '–');
+            return cleaned.Length >= 2 ? cleaned : album;
+        }
+
+        private static double CalculateTrackTitleEvidence(IEnumerable<SlskdFileData> files, List<string>? expectedTracks)
+        {
+            if (expectedTracks == null || expectedTracks.Count == 0)
+                return 0;
+
+            List<string> titles = expectedTracks.Select(NormalizeString).Where(t => t.Length >= 4).ToList();
+            if (titles.Count == 0)
+                return 0;
+
+            string haystack = NormalizeString(string.Join(" ", files
+                .Select(f => Path.GetFileNameWithoutExtension(f.Filename ?? string.Empty))
+                .Select(n => TrackNumberPrefixRegex().Replace(n, string.Empty))));
+
+            return titles.Count(haystack.Contains) / (double)titles.Count;
+        }
+
+        private static double CalculateDurationMatch(IEnumerable<SlskdFileData> files, List<int>? trackDurationsMs)
+        {
+            if (trackDurationsMs == null || trackDurationsMs.Count == 0)
+                return -1;
+
+            List<int> trackSeconds = [.. trackDurationsMs
+                .Select(ms => (int)Math.Round(ms / 1000.0))
+                .Where(d => d > 0)
+                .OrderBy(d => d)];
+
+            if (trackSeconds.Count < trackDurationsMs.Count * 0.8)
+                return -1;
+
+            List<SlskdFileData> fileList = files as List<SlskdFileData> ?? files.ToList();
+            List<int> fileSeconds = [.. fileList
+                .Where(f => f.Length is > 0)
+                .Select(f => f.Length!.Value)
+                .OrderBy(d => d)];
+
+            if (fileSeconds.Count < fileList.Count * 0.8)
+                return -1;
+
+            if (trackSeconds.Count == 0 || fileSeconds.Count == 0)
+                return -1;
+
+            int comparable = Math.Min(trackSeconds.Count, fileSeconds.Count);
+
+            const int toleranceSeconds = 8;
+            int matches = 0;
+            int ti = 0, fi = 0;
+
+            while (ti < trackSeconds.Count && fi < fileSeconds.Count)
+            {
+                int diff = fileSeconds[fi] - trackSeconds[ti];
+                if (Math.Abs(diff) <= toleranceSeconds)
+                {
+                    matches++;
+                    ti++;
+                    fi++;
+                }
+                else if (diff < 0)
+                    fi++;
+                else
+                    ti++;
+            }
+
+            return matches / (double)comparable;
+        }
+
+        private static bool HasTrackNumberGaps(IEnumerable<SlskdFileData> files)
+        {
+            List<int> numbers = [.. files
+                .Select(f => TrackNumberPrefixCaptureRegex().Match(System.IO.Path.GetFileName(f.Filename ?? string.Empty)))
+                .Where(m => m.Success)
+                .Select(m => int.Parse(m.Groups[1].Value))
+                .Where(n => n is > 0 and <= 150)
+                .Distinct()
+                .Order()];
+
+            return numbers.Count >= 3 && numbers[^1] - numbers[0] + 1 != numbers.Count;
+        }
+
+        private static List<string> ExtractReleaseTags(string path) =>
+            [.. ReleaseTagRegex().Matches(path)
+                .Select(m => ReduceWhitespaceRegex().Replace(m.Groups["tag"].Value, " ").Trim().ToUpperInvariant())
+                .Distinct()
+                .Take(4)];
+
+        private static string DetectSourceTag(string path)
+        {
+            Match match = SourceTagRegex().Match(path);
+            if (!match.Success)
+                return "WEB";
+
+            string value = match.Value.ToUpperInvariant();
+            return value switch
+            {
+                "VINYL" => "Vinyl",
+                "WEB" => "WEB",
+                "SACD" or "MFSL" or "MOFI" => "SACD",
+                _ when value.StartsWith("DSD") => "SACD",
+                _ => "CD"
+            };
         }
 
         private (AudioFormat Codec, int? BitRate, int? BitDepth, int? SampleRate, long TotalSize, int TotalDuration) AnalyzeAudioQuality(IGrouping<string, SlskdFileData> directory)
@@ -479,12 +758,11 @@ namespace Tubifarry.Indexers.Soulseek
 
         public static string? GetMostCommonExtension(IEnumerable<SlskdFileData> files)
         {
-            List<string?> extensions = files
+            List<string?> extensions = [.. files
                 .Select(f => string.IsNullOrEmpty(f.Extension)
                     ? Path.GetExtension(f.Filename)?.TrimStart('.').ToLowerInvariant()
                     : f.Extension)
-                .Where(ext => !string.IsNullOrEmpty(ext))
-                .ToList();
+                .Where(ext => !string.IsNullOrEmpty(ext))];
 
             if (extensions.Count == 0)
                 return null;
@@ -529,6 +807,30 @@ namespace Tubifarry.Indexers.Soulseek
         [GeneratedRegex(@"^(?<album>[^(\[]+)(?:\s*[\(\[](?<year>19\d{2}|20\d{2})[\)\]])?", RegexOptions.ExplicitCapture | RegexOptions.Compiled)]
         private static partial Regex AlbumYearRegex();
 
+        [GeneratedRegex(@"^[\(\[]?(?<year>19\d{2}|20\d{2})[\)\]]?\s*[-–._]*\s*(?<album>.+)$", RegexOptions.ExplicitCapture | RegexOptions.Compiled)]
+        private static partial Regex LeadingYearAlbumRegex();
+
+        [GeneratedRegex(@"^(?<artist>[^-]+?)\s*-\s*(?:[\(\[](?<year>19\d{2}|20\d{2})[\)\]]|(?<year>19\d{2}|20\d{2})\s*-)\s*(?<album>.+)$", RegexOptions.ExplicitCapture | RegexOptions.Compiled)]
+        private static partial Regex ArtistYearAlbumRegex();
+
+        [GeneratedRegex(@"(?ix)\b(?<tag>
+            box\s?set | mono |
+            24\s?[-_]?\s?bit(?:\s*/?\s*\d{2,3}(?:\.\d)?\s?khz)? | \d{2,3}(?:\.\d)?\s?khz
+            )\b", RegexOptions.IgnoreCase | RegexOptions.ExplicitCapture | RegexOptions.Compiled)]
+        private static partial Regex ReleaseTagRegex();
+
+        [GeneratedRegex(@"(?i)@\w+|\((?:19|20)\d{2}-\d{2}-\d{2}\)|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", RegexOptions.Compiled)]
+        private static partial Regex JunkTokenRegex();
+
+        [GeneratedRegex(@"^\s*[a-dA-D]?\d{1,3}\s*[-._) ]+\s*", RegexOptions.Compiled)]
+        private static partial Regex TrackNumberPrefixRegex();
+
+        [GeneratedRegex(@"^\s*(\d{1,3})\b", RegexOptions.Compiled)]
+        private static partial Regex TrackNumberPrefixCaptureRegex();
+
+        [GeneratedRegex(@"(?i)\b(vinyl|sacd|dsd\d*|mfsl|mofi|web|cd)\b", RegexOptions.Compiled)]
+        private static partial Regex SourceTagRegex();
+
         [GeneratedRegex(@"^(?<year>19\d{2}|20\d{2})\s*-\s*(?<artist>[^-]+)\s*-\s*(?<album>.+)(?:\s*[\(\[].+[\)\]])*$", RegexOptions.ExplicitCapture | RegexOptions.Compiled)]
         private static partial Regex YearArtistAlbumRegex();
 
@@ -559,7 +861,13 @@ namespace Tubifarry.Indexers.Soulseek
         [GeneratedRegex(@"[^\w\s$-]", RegexOptions.Compiled)]
         private static partial Regex RemoveNonAlphanumericRegex();
 
-        [GeneratedRegex(@"[._/]+", RegexOptions.Compiled)]
+        [GeneratedRegex(@"[._/\\]+", RegexOptions.Compiled)]
         private static partial Regex NormalizeCharactersRegex();
+
+        [GeneratedRegex(@"\s*\([^)]+\)\s*$", RegexOptions.Compiled)]
+        private static partial Regex TrailingParenthesizedRegex();
+
+        [GeneratedRegex(@"^\[\d+\]\s", RegexOptions.Compiled)]
+        private static partial Regex NumberedCategoryRegex();
     }
 }

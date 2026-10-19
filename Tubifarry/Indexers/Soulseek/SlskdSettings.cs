@@ -22,11 +22,6 @@ namespace Tubifarry.Indexers.Soulseek
                 .Must(url => string.IsNullOrEmpty(url) || (Uri.IsWellFormedUriString(url, UriKind.Absolute) && !url.EndsWith('/')))
                 .WithMessage("External URL must be a valid URL and must not end with a slash ('/').");
 
-            // API Key validation
-            RuleFor(c => c.ApiKey)
-                .NotEmpty()
-                .WithMessage("API Key is required.");
-
             // File Limit validation
             RuleFor(c => c.FileLimit)
                 .GreaterThanOrEqualTo(1)
@@ -128,7 +123,7 @@ namespace Tubifarry.Indexers.Soulseek
         public int FileLimit { get; set; } = 10000;
 
         [FieldDefinition(8, Type = FieldType.Number, Label = "Max Peer Queue", HelpText = "Max queued requests per peer", Advanced = true)]
-        public int MaximumPeerQueueLength { get; set; } = 1000000;
+        public int MaximumPeerQueueLength { get; set; } = 250;
 
         private int _minimumPeerUploadSpeedBytes;
 
@@ -140,16 +135,16 @@ namespace Tubifarry.Indexers.Soulseek
         }
 
         [FieldDefinition(10, Type = FieldType.Number, Label = "Min File Count", HelpText = "Minimum files per response", Advanced = true)]
-        public int MinimumResponseFileCount { get; set; } = 1;
+        public int MinimumResponseFileCount { get; set; } = 2;
 
         [FieldDefinition(11, Type = FieldType.Select, SelectOptions = typeof(TrackCountFilterType), Label = "Track Count Filter", HelpText = "Filter releases by track count matching", Advanced = true)]
         public int TrackCountFilter { get; set; } = (int)TrackCountFilterType.Disabled;
 
         [FieldDefinition(12, Type = FieldType.Number, Label = "Response Limit", HelpText = "Max search responses", Advanced = true)]
-        public int ResponseLimit { get; set; } = 100;
+        public int ResponseLimit { get; set; } = 200;
 
         [FieldDefinition(13, Type = FieldType.Number, Label = "Timeout", Unit = "seconds", HelpText = "Search timeout", Advanced = true)]
-        public double TimeoutInSeconds { get; set; } = 5;
+        public double TimeoutInSeconds { get; set; } = 15;
 
         [FieldDefinition(14, Type = FieldType.Checkbox, Label = "Append Year", HelpText = "Append the release year to the first search (ignored when templates are set)", Advanced = true)]
         public bool AppendYear { get; set; }
@@ -190,6 +185,9 @@ namespace Tubifarry.Indexers.Soulseek
         [FieldDefinition(26, Type = FieldType.Number, Label = "Max Retry Attempts", HelpText = "Retries when slskd is busy searching", Hidden = HiddenType.Hidden, Advanced = true)]
         public int MaxRetryAttempts { get; set; } = 3;
 
+        [FieldDefinition(27, Type = FieldType.Checkbox, Label = "Show Priority in Title", HelpText = "Append the calculated release priority to the release title (e.g. [Priority 4200]).", Advanced = true)]
+        public bool ShowPriorityInTitle { get; set; }
+
         public NzbDroneValidationResult Validate() => new(Validator.Validate(this));
     }
 
@@ -211,10 +209,10 @@ namespace Tubifarry.Indexers.Soulseek
         [FieldOption(Label = "Disabled", Hint = "No track count filtering.")]
         Disabled = 0,
 
-        [FieldOption(Label = "Exact", Hint = "Only allow releases matching the exact track count.")]
+        [FieldOption(Label = "Exact", Hint = "Only allow releases whose track count matches one edition of the album.")]
         Exact = 1,
 
-        [FieldOption(Label = "Lower", Hint = "Filter out releases with fewer tracks than expected.")]
+        [FieldOption(Label = "Lower", Hint = "Filter out releases with fewer tracks than the shortest edition of the album.")]
         Lower = 2,
 
         [FieldOption(Label = "Unfitting", Hint = "Exclude releases with significantly wrong track count.")]

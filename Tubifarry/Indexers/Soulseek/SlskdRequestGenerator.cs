@@ -1,7 +1,6 @@
 using NLog;
 using NzbDrone.Common.Http;
 using NzbDrone.Common.Instrumentation;
-using NzbDrone.Common.Serializer;
 using NzbDrone.Core.Indexers;
 using NzbDrone.Core.Indexers.Exceptions;
 using NzbDrone.Core.IndexerSearch.Definitions;
@@ -18,6 +17,8 @@ namespace Tubifarry.Indexers.Soulseek
 {
     internal class SlskdRequestGenerator : IIndexerRequestGenerator<LazyIndexerPageableRequest>
     {
+        private static readonly TimeSpan SearchStartupGrace = TimeSpan.FromSeconds(2);
+        private static readonly TimeSpan SearchDrainGrace = TimeSpan.FromSeconds(20);
         private static readonly JsonSerializerOptions _jsonOptions = new() { PropertyNameCaseInsensitive = true };
         private readonly SlskdIndexer _indexer;
         private readonly Logger _logger;
@@ -52,8 +53,13 @@ namespace Tubifarry.Indexers.Soulseek
             AlbumRelease? monitoredRelease = albumReleases?.FirstOrDefault(r => r.Monitored);
             int trackCount = monitoredRelease?.TrackCount
                 ?? (albumReleases?.Any() == true ? albumReleases.Min(x => x.TrackCount) : 0);
-            List<string> tracks = (monitoredRelease ?? albumReleases?.FirstOrDefault(x => x.Tracks?.Value is { Count: > 0 }))
-                ?.Tracks?.Value?.Where(x => !string.IsNullOrEmpty(x.Title)).Select(x => x.Title).ToList() ?? [];
+            AlbumRelease? trackSource = monitoredRelease ?? albumReleases?.FirstOrDefault(x => x.Tracks?.Value is { Count: > 0 });
+            List<Track>? trackList = trackSource?.Tracks?.Value?.Where(x => !string.IsNullOrEmpty(x.Title)).ToList();
+            List<string> tracks = trackList?.Select(x => x.Title).ToList() ?? [];
+            List<int> trackDurations = trackList?.Where(t => t.Duration > 0).Select(t => t.Duration).ToList() ?? [];
+            List<int> trackCounts = albumReleases?.Select(r => r.TrackCount).Where(c => c > 0).Distinct().Order().ToList() ?? [];
+            if (trackCounts.Count == 0 && trackCount > 0)
+                trackCounts = [trackCount];
 
             _processedSearches.Clear();
 
@@ -66,9 +72,13 @@ namespace Tubifarry.Indexers.Soulseek
                 TrackCount: trackCount,
                 Aliases: searchCriteria.Artist?.Metadata.Value.Aliases ?? [],
                 Tracks: tracks,
+                TrackDurations: trackDurations,
                 Settings: Settings,
                 ProcessedSearches: _processedSearches,
-                SearchCriteria: searchCriteria);
+                SearchCriteria: searchCriteria)
+            {
+                TrackCounts = trackCounts
+            };
 
             return _searchPipeline.BuildChain(context, ExecuteSearch);
         }
@@ -82,8 +92,10 @@ namespace Tubifarry.Indexers.Soulseek
             AlbumRelease? monitoredRelease = albumReleases?.FirstOrDefault(r => r.Monitored);
             int trackCount = monitoredRelease?.TrackCount
                 ?? (albumReleases?.Any() == true ? albumReleases.Min(x => x.TrackCount) : 0);
-            List<string> tracks = (monitoredRelease ?? albumReleases?.FirstOrDefault(x => x.Tracks?.Value is { Count: > 0 }))
-                ?.Tracks?.Value?.Where(x => !string.IsNullOrEmpty(x.Title)).Select(x => x.Title).ToList() ?? [];
+            AlbumRelease? trackSource = monitoredRelease ?? albumReleases?.FirstOrDefault(x => x.Tracks?.Value is { Count: > 0 });
+            List<Track>? trackList = trackSource?.Tracks?.Value?.Where(x => !string.IsNullOrEmpty(x.Title)).ToList();
+            List<string> tracks = trackList?.Select(x => x.Title).ToList() ?? [];
+            List<int> trackDurations = trackList?.Where(t => t.Duration > 0).Select(t => t.Duration).ToList() ?? [];
 
             _processedSearches.Clear();
 
@@ -96,6 +108,7 @@ namespace Tubifarry.Indexers.Soulseek
                 TrackCount: trackCount,
                 Aliases: searchCriteria.Artist?.Metadata.Value.Aliases ?? [],
                 Tracks: tracks,
+                TrackDurations: trackDurations,
                 Settings: Settings,
                 ProcessedSearches: _processedSearches,
                 SearchCriteria: searchCriteria);
@@ -105,7 +118,12 @@ namespace Tubifarry.Indexers.Soulseek
 
         private IEnumerable<IndexerRequest> ExecuteSearch(SearchQuery query)
         {
-            string? searchText = query.SearchText ?? SlskdTextProcessor.BuildSearchText(query.Artist, query.Album);
+            string? searchText = query.SearchText;
+            if (string.IsNullOrWhiteSpace(searchText))
+            {
+                searchText = SlskdTextProcessor.RewriteRestrictedTerms(
+                    SlskdTextProcessor.BuildSearchText(query.Artist, query.Album));
+            }
 
             if (string.IsNullOrWhiteSpace(searchText))
                 return [];
@@ -153,7 +171,7 @@ namespace Tubifarry.Indexers.Soulseek
                     _searchLimiter?.Dispose();
                     _currentLimit = Settings.ConcurrentSearchLimit;
                     _searchLimiter = new SemaphoreSlim(Settings.ConcurrentSearchLimit, Settings.ConcurrentSearchLimit);
-                    _logger.Warn($"Search limiter initialized: {_currentLimit} concurrent");
+                    _logger.Debug($"Search limiter initialized: {_currentLimit} concurrent");
                 }
                 return _searchLimiter;
             }
@@ -182,9 +200,9 @@ namespace Tubifarry.Indexers.Soulseek
 
                         _logger.Debug($"Search: {searchText}");
 
-                        dynamic searchData = CreateSearchData(searchText);
+                        SlskdSearchRequestBody searchData = CreateSearchData(searchText, GetFewestTracks(query));
                         string searchId = searchData.Id;
-                        dynamic searchRequest = CreateSearchRequest(searchData);
+                        HttpRequest searchRequest = CreateSearchRequest(searchData);
 
                         await ExecuteSearchAsync(searchRequest, searchId);
 
@@ -242,26 +260,35 @@ namespace Tubifarry.Indexers.Soulseek
             }
         }
 
-        private dynamic CreateSearchData(string searchText) => new
+        private static int GetFewestTracks(SearchQuery query) =>
+            query.TrackCounts.Count > 0 ? query.TrackCounts.Min() : query.TrackCount;
+
+        private int GetEffectiveMinimumFileCount(int trackCount) =>
+            trackCount > 0 ? Math.Min(Settings.MinimumResponseFileCount, trackCount) : Settings.MinimumResponseFileCount;
+
+        private SlskdSearchRequestBody CreateSearchData(string searchText, int trackCount) => new()
         {
             Id = Guid.NewGuid().ToString(),
-            Settings.FileLimit,
+            FileLimit = Settings.FileLimit,
             FilterResponses = true,
-            Settings.MaximumPeerQueueLength,
-            Settings.MinimumPeerUploadSpeed,
-            Settings.MinimumResponseFileCount,
-            Settings.ResponseLimit,
+            MaximumPeerQueueLength = Settings.MaximumPeerQueueLength,
+            MinimumPeerUploadSpeed = Settings.MinimumPeerUploadSpeed,
+            MinimumResponseFileCount = GetEffectiveMinimumFileCount(trackCount),
+            ResponseLimit = Settings.ResponseLimit,
             SearchText = searchText,
             SearchTimeout = (int)(Settings.TimeoutInSeconds * 1000),
         };
 
-        private HttpRequest CreateSearchRequest(dynamic searchData)
+        private HttpRequest CreateSearchRequest(SlskdSearchRequestBody searchData)
         {
-            HttpRequest searchRequest = new HttpRequestBuilder($"{Settings.BaseUrl}/api/v0/searches")
-                .SetHeader("X-API-KEY", Settings.ApiKey)
+            HttpRequestBuilder builder = new HttpRequestBuilder($"{Settings.BaseUrl}/api/v0/searches")
                 .SetHeader("Content-Type", "application/json")
-                .Post()
-                .Build();
+                .Post();
+
+            if (!string.IsNullOrWhiteSpace(Settings.ApiKey))
+                builder.SetHeader("X-API-KEY", Settings.ApiKey);
+
+            HttpRequest searchRequest = builder.Build();
 
             searchRequest.SetContent(JsonSerializer.Serialize(searchData));
             return searchRequest;
@@ -275,83 +302,84 @@ namespace Tubifarry.Indexers.Soulseek
 
         private HttpRequest CreateResultRequest(string searchId, SearchQuery query)
         {
-            HttpRequest request = new HttpRequestBuilder($"{Settings.BaseUrl}/api/v0/searches/{searchId}")
-                .AddQueryParam("includeResponses", true)
-                .SetHeader("X-API-KEY", Settings.ApiKey)
-                .Build();
+            HttpRequestBuilder builder = new HttpRequestBuilder($"{Settings.BaseUrl}/api/v0/searches/{searchId}")
+                .AddQueryParam("includeResponses", true);
+            if (!string.IsNullOrWhiteSpace(Settings.ApiKey))
+                builder.SetHeader("X-API-KEY", Settings.ApiKey);
+
+            HttpRequest request = builder.Build();
 
             TrackCountFilterType filterType = (TrackCountFilterType)Settings.TrackCountFilter;
+
+            IReadOnlyList<int> editionTrackCounts = query.TrackCounts.Count > 0 ? query.TrackCounts : query.TrackCount > 0 ? [query.TrackCount] : [];
+            int fewestTracks = GetFewestTracks(query);
+            int effectiveMinimum = GetEffectiveMinimumFileCount(fewestTracks);
+            int mostTracks = editionTrackCounts.Count > 0 ? editionTrackCounts.Max() : query.TrackCount;
 
             int minimumFiles = filterType switch
             {
                 TrackCountFilterType.Exact or TrackCountFilterType.Lower or TrackCountFilterType.Unfitting
-                    => Math.Max(Settings.MinimumResponseFileCount, query.TrackCount),
-                _ => Settings.MinimumResponseFileCount
+                    => Math.Max(effectiveMinimum, fewestTracks),
+                _ => effectiveMinimum
             };
 
             int? maximumFiles = filterType switch
             {
-                TrackCountFilterType.Exact => query.TrackCount,
-                TrackCountFilterType.Unfitting => query.TrackCount + Math.Max(2, (int)Math.Ceiling(Math.Log(query.TrackCount) * 1.67)),
+                TrackCountFilterType.Exact => mostTracks,
+                TrackCountFilterType.Unfitting => mostTracks + Math.Max(2, (int)Math.Ceiling(Math.Log(mostTracks) * 1.67)),
                 _ => null
             };
 
-            request.ContentSummary = new
-            {
-                Album = query.Album ?? "",
-                Artist = query.Artist,
-                Interactive = query.Interactive,
-                ExpandDirectory = query.ExpandDirectory,
-                MimimumFiles = minimumFiles,
-                MaximumFiles = maximumFiles
-            }.ToJson();
+            request.ContentSummary = JsonSerializer.Serialize(new SlskdSearchData(
+                Artist: query.Artist,
+                Album: query.Album ?? "",
+                Interactive: query.Interactive,
+                ExpandDirectory: query.ExpandDirectory,
+                MinimumFiles: minimumFiles,
+                MaximumFiles: maximumFiles,
+                Tracks: query.Tracks.Take(50).ToList(),
+                TrackDurations: query.TrackDurations.Count > 0 ? [.. query.TrackDurations] : null,
+                TrackCounts: editionTrackCounts.Count > 0 ? [.. editionTrackCounts] : null));
 
             return request;
         }
 
         private async Task WaitOnSearchCompletionAsync(string searchId, TimeSpan timeout)
         {
-            DateTime startTime = DateTime.UtcNow.AddSeconds(2);
+            DateTime timeoutAt = DateTime.UtcNow + SearchStartupGrace + timeout;
+            DateTime? drainEndsAt = null;
             string state = "InProgress";
-            int totalFilesFound = 0;
-            bool hasTimedOut = false;
-            DateTime timeoutEndTime = DateTime.UtcNow;
 
             while (state == "InProgress")
             {
-                TimeSpan elapsed = DateTime.UtcNow - startTime;
+                DateTime now = DateTime.UtcNow;
 
-                if (elapsed > timeout && !hasTimedOut)
-                {
-                    hasTimedOut = true;
-                    timeoutEndTime = DateTime.UtcNow.AddSeconds(20);
-                }
-                else if (hasTimedOut && timeoutEndTime < DateTime.UtcNow)
-                {
+                if (drainEndsAt == null && now >= timeoutAt)
+                    drainEndsAt = now + SearchDrainGrace;
+                else if (drainEndsAt != null && now >= drainEndsAt)
                     break;
-                }
 
                 JsonNode? searchStatus = await GetSearchResultsAsync(searchId);
 
                 state = searchStatus?["state"]?.GetValue<string>() ?? "InProgress";
-                int fileCount = searchStatus?["fileCount"]?.GetValue<int>() ?? 0;
-
-                if (fileCount > totalFilesFound)
-                    totalFilesFound = fileCount;
-
-                double progress = Math.Clamp(fileCount / (double)Settings.FileLimit, 0.0, 1.0);
-                double delay = hasTimedOut && DateTime.UtcNow < timeoutEndTime ? 1.0 : CalculateQuadraticDelay(progress);
-
-                await Task.Delay(TimeSpan.FromSeconds(delay));
                 if (state != "InProgress")
                     break;
+
+                int fileCount = searchStatus?["fileCount"]?.GetValue<int>() ?? 0;
+                double progress = Math.Clamp(fileCount / (double)Settings.FileLimit, 0.0, 1.0);
+                double delay = drainEndsAt != null ? 1.0 : CalculateQuadraticDelay(progress);
+
+                await Task.Delay(TimeSpan.FromSeconds(delay));
             }
         }
 
         private async Task<JsonNode?> GetSearchResultsAsync(string searchId)
         {
-            HttpRequest searchResultsRequest = new HttpRequestBuilder($"{Settings.BaseUrl}/api/v0/searches/{searchId}")
-                     .SetHeader("X-API-KEY", Settings.ApiKey).Build();
+            HttpRequestBuilder builder = new HttpRequestBuilder($"{Settings.BaseUrl}/api/v0/searches/{searchId}");
+            if (!string.IsNullOrWhiteSpace(Settings.ApiKey))
+                builder.SetHeader("X-API-KEY", Settings.ApiKey);
+
+            HttpRequest searchResultsRequest = builder.Build();
 
             HttpResponse response = await _client.ExecuteAsync(searchResultsRequest);
 
@@ -389,13 +417,17 @@ namespace Tubifarry.Indexers.Soulseek
         {
             try
             {
-                HttpRequest request = new HttpRequestBuilder($"{Settings.BaseUrl}/api/v0/users/{Uri.EscapeDataString(username)}/directory")
-                    .SetHeader("X-API-KEY", Settings.ApiKey)
+                HttpRequestBuilder builder = new HttpRequestBuilder($"{Settings.BaseUrl}/api/v0/users/{Uri.EscapeDataString(username)}/directory")
                     .SetHeader("Content-Type", "application/json")
-                    .Post()
-                    .Build();
+                    .Post();
+
+                if (!string.IsNullOrWhiteSpace(Settings.ApiKey))
+                    builder.SetHeader("X-API-KEY", Settings.ApiKey);
+
+                HttpRequest request = builder.Build();
 
                 request.SetContent(JsonSerializer.Serialize(new { directory = directoryPath }));
+                request.SuppressHttpError = true;
 
                 HttpResponse response = await _client.ExecuteAsync(request);
 
@@ -403,32 +435,40 @@ namespace Tubifarry.Indexers.Soulseek
                 {
                     SlskdDirectoryApiResponse[]? directoryResponse = JsonSerializer.Deserialize<SlskdDirectoryApiResponse[]>(response.Content, _jsonOptions);
 
-                    if (directoryResponse?.Length > 0 && directoryResponse[0].Files?.Any() == true)
+                    if (directoryResponse == null || directoryResponse.Length == 0)
+                        return null;
+
+                    string originalExtension = originalTrack.Extension?.ToLowerInvariant() ?? "";
+
+                    List<SlskdFileData> directoryFiles = [.. directoryResponse
+                        .Where(d => d.Files?.Count > 0)
+                        .SelectMany(d => d.Files.Select(f => (Dir: string.IsNullOrEmpty(d.Name) ? directoryPath : d.Name, File: f)))
+                        .Where(x => AudioFormatHelper.GetAudioCodecFromExtension(Path.GetExtension(x.File.Filename)) != AudioFormat.Unknown)
+                        .Select(x =>
+                        {
+                            SlskdDirectoryApiFile f = x.File;
+                            string fileExtension = Path.GetExtension(f.Filename)?.TrimStart('.').ToLowerInvariant() ?? "";
+                            bool sameExtension = fileExtension == originalExtension;
+
+                            return new SlskdFileData(
+                                Filename: $"{x.Dir}\\{f.Filename}",
+                                BitRate: sameExtension ? originalTrack.BitRate : null,
+                                BitDepth: sameExtension ? originalTrack.BitDepth : null,
+                                Size: f.Size,
+                                Length: sameExtension ? originalTrack.Length : null,
+                                Extension: fileExtension,
+                                SampleRate: sameExtension ? originalTrack.SampleRate : null,
+                                Code: f.Code,
+                                IsLocked: false
+                            );
+                        })];
+
+                    if (directoryFiles.Count != 0)
                     {
-                        string originalExtension = originalTrack.Extension?.ToLowerInvariant() ?? "";
-
-                        List<SlskdFileData> directoryFiles = directoryResponse[0].Files
-                            .Where(f => AudioFormatHelper.GetAudioCodecFromExtension(Path.GetExtension(f.Filename)) != AudioFormat.Unknown)
-                            .Select(f =>
-                            {
-                                string fileExtension = Path.GetExtension(f.Filename)?.TrimStart('.').ToLowerInvariant() ?? "";
-                                bool sameExtension = fileExtension == originalExtension;
-
-                                return new SlskdFileData(
-                                    Filename: $"{directoryPath}\\{f.Filename}",
-                                    BitRate: sameExtension ? originalTrack.BitRate : null,
-                                    BitDepth: sameExtension ? originalTrack.BitDepth : null,
-                                    Size: f.Size,
-                                    Length: sameExtension ? originalTrack.Length : null,
-                                    Extension: fileExtension,
-                                    SampleRate: sameExtension ? originalTrack.SampleRate : null,
-                                    Code: f.Code,
-                                    IsLocked: false
-                                );
-                            }).ToList();
-
-                        if (directoryFiles.Count != 0)
-                            return directoryFiles.GroupBy(f => SlskdTextProcessor.GetDirectoryFromFilename(f.Filename)).First();
+                        List<IGrouping<string, SlskdFileData>> merged = SlskdTextProcessor.MergeDiscSubdirectories(
+                            directoryFiles.GroupBy(f => SlskdTextProcessor.GetDirectoryFromFilename(f.Filename)));
+                        if (merged.Count > 0)
+                            return merged[0];
                     }
                 }
                 else

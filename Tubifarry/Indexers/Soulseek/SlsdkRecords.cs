@@ -63,7 +63,8 @@ namespace Tubifarry.Indexers.Soulseek
         [property: JsonPropertyName("queueLength")] int QueueLength,
         [property: JsonPropertyName("token")] int Token,
         [property: JsonPropertyName("fileCount")] int FileCount,
-        [property: JsonPropertyName("files")] List<SlskdFileData> Files)
+        [property: JsonPropertyName("files")] List<SlskdFileData> Files,
+        int RecentFailures = 0)
     {
         public int CalculatePriority(int expectedTrackCount = 0)
         {
@@ -96,8 +97,14 @@ namespace Tubifarry.Indexers.Soulseek
             {
                 int trackDiff = actualTrackCount - expectedTrackCount;
 
-                if (trackDiff < 0) // -1: ~500 pts, -2: ~60 pts, -3+: near 0
-                    score += (int)(2500 * Math.Exp(-Math.Pow(Math.Abs(trackDiff), 2) * 5));
+                if (trackDiff < 0) // MISSING TRACKS: +2500 perfect, linear to max +1500 at 1 missing, -2000 at 75%, flat -2000 below
+                {
+                    double ratio = actualTrackCount / (double)expectedTrackCount;
+                    if (ratio < 0.75)
+                        score -= 2000;
+                    else
+                        score += (int)(-2000 + (ratio - 0.75) / 0.25 * 3500);
+                }
                 else if (trackDiff == 0)  // PERFECT MATCH
                     score += 2500;
                 else   // EXTRA TRACKS: Less critical, just penalized: +1: ~1600 pts, +2: ~600 pts, +3: ~100 pts, +15: near 0
@@ -108,21 +115,38 @@ namespace Tubifarry.Indexers.Soulseek
             score += (int)(Math.Pow(availabilityRatio, 2.0) * 2000);
 
             // ===== UPLOAD SPEED (0 to +1800) =====
-            if (UploadSpeed > 0)
+            double speedMBps = UploadSpeed / (1024.0 * 1024.0);
+            if (speedMBps > 0)
+                score += Math.Min(1800, (int)(Math.Log10(speedMBps + 1) * 1800));
+
+            // ===== ESTIMATED QUEUE WAIT (0 to +2300) =====
+            const double assumedBytesPerQueuedItem = 40.0 * 1024 * 1024;
+            double effectiveSpeed = Math.Max(UploadSpeed, 128 * 1024);
+            double estimatedWaitSeconds = QueueLength * assumedBytesPerQueuedItem / effectiveSpeed;
+            double queueFactor = Math.Exp(-estimatedWaitSeconds / 900.0);
+            score += (int)(queueFactor * 2300);
+
+            // ===== FILE CONSISTENCY (0 to +300) =====
+            if (Files.Count > 0)
             {
-                double speedMbps = UploadSpeed / (1024.0 * 1024.0 / 8.0);
-                score += Math.Min(1800, (int)(Math.Log10(Math.Max(0.1, speedMbps) + 1) * 1100));
+                int distinctExtensions = Files
+                    .Select(f => (f.Extension ?? System.IO.Path.GetExtension(f.Filename) ?? string.Empty).ToLowerInvariant())
+                    .Where(ext => ext.Length > 0)
+                    .Distinct()
+                    .Count();
+
+                double durationCoverage = Files.Count(f => f.Length is > 0) / (double)Files.Count;
+                score += (int)((distinctExtensions <= 1 ? 150 : 0) + durationCoverage * 150);
             }
-
-            // ===== QUEUE LENGTH (50 to +1500) =====
-            double queueFactor = Math.Pow(0.94, Math.Min(QueueLength, 40));
-            score += (int)(queueFactor * 1500);
-
-            // ===== FREE UPLOAD SLOT (0 or +800) =====
-            score += HasFreeUploadSlot ? 800 : 0;
 
             // ===== COLLECTION SIZE (0 to +300) =====
             score += Math.Min(300, (int)(Math.Log10(Math.Max(1, FileCount) + 1) * 150));
+
+            if (!HasFreeUploadSlot)
+                score = (int)(score * 0.6 * Math.Pow(0.97, Math.Min(QueueLength, 100)));
+
+            if (RecentFailures > 0)
+                score = (int)(score * Math.Pow(0.7, Math.Min(RecentFailures, 8)));
 
             return Math.Clamp(score, 0, 10000);
         }
@@ -134,14 +158,67 @@ namespace Tubifarry.Indexers.Soulseek
         [property: JsonPropertyName("interactive")] bool Interactive,
         [property: JsonPropertyName("expandDirectory")] bool ExpandDirectory,
         [property: JsonPropertyName("mimimumFiles")] int MinimumFiles,
-        [property: JsonPropertyName("maximumFiles")] int? MaximumFiles)
+        [property: JsonPropertyName("maximumFiles")] int? MaximumFiles,
+        [property: JsonPropertyName("tracks")] List<string>? Tracks = null,
+        [property: JsonPropertyName("trackDurations")] List<int>? TrackDurations = null,
+        [property: JsonPropertyName("trackCounts")] List<int>? TrackCounts = null)
     {
         private static readonly JsonSerializerOptions _jsonOptions = new() { PropertyNameCaseInsensitive = true };
         public static SlskdSearchData FromJson(string jsonString) => JsonSerializer.Deserialize<SlskdSearchData>(jsonString, _jsonOptions)!;
     }
 
+    public record SlskdEnqueueFailure(
+        [property: JsonPropertyName("filename")] string Filename,
+        [property: JsonPropertyName("message")] string Message
+    );
+
+    public record SlskdEnqueueResult(string? BatchId, List<string> Enqueued, List<SlskdEnqueueFailure> Failed)
+    {
+        public bool AllFailed => Enqueued.Count == 0 && Failed.Count > 0;
+    }
+
+    public record SlskdDestinationConfig(string DownloadsDirectory, string? SubdirectoryPattern)
+    {
+        public const string DefaultPattern = "${SOURCE_DIRECTORY}";
+
+        public bool UsesDefaultPattern =>
+            SubdirectoryPattern is null ||
+            string.Equals(SubdirectoryPattern, DefaultPattern, StringComparison.OrdinalIgnoreCase);
+
+        public static SlskdDestinationConfig? FromOptions(JsonElement options)
+        {
+            if (!options.TryGetProperty("directories", out JsonElement directories) ||
+                !directories.TryGetProperty("downloads", out JsonElement downloads) ||
+                downloads.GetString() is not { Length: > 0 } downloadsDirectory)
+                return null;
+
+            string? pattern = null;
+            if (options.TryGetProperty("transfers", out JsonElement transfers) &&
+                transfers.TryGetProperty("download", out JsonElement download) &&
+                download.TryGetProperty("destination", out JsonElement destination) &&
+                destination.TryGetProperty("subdirectory", out JsonElement subdirectory))
+                pattern = subdirectory.GetString();
+
+            return new SlskdDestinationConfig(downloadsDirectory, pattern);
+        }
+    }
+
+    public sealed record SlskdSearchRequestBody
+    {
+        public required string Id { get; init; }
+        public int FileLimit { get; init; }
+        public bool FilterResponses { get; init; }
+        public long MaximumPeerQueueLength { get; init; }
+        public int MinimumPeerUploadSpeed { get; init; }
+        public int MinimumResponseFileCount { get; init; }
+        public int ResponseLimit { get; init; }
+        public required string SearchText { get; init; }
+        public int SearchTimeout { get; init; }
+    }
+
     public record SlskdDirectoryApiResponse(
-      [property: JsonPropertyName("files")] List<SlskdDirectoryApiFile> Files
+      [property: JsonPropertyName("files")] List<SlskdDirectoryApiFile> Files,
+      [property: JsonPropertyName("name")] string? Name = null
     );
 
     public record SlskdDirectoryApiFile(

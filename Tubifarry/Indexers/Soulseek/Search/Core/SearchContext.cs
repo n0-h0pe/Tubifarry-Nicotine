@@ -24,9 +24,11 @@ public sealed record SearchContext
     public string? Year { get; init; }
     public bool Interactive { get; init; }
     public int TrackCount { get; init; }
+    public IReadOnlyList<int> TrackCounts { get; init; } = [];
     public PrimaryAlbumType PrimaryType { get; init; }
     public IReadOnlyList<string> Aliases { get; init; }
     public IReadOnlyList<string> Tracks { get; init; }
+    public IReadOnlyList<int> TrackDurations { get; init; }
     public SlskdSettings Settings { get; init; }
     public HashSet<string> ProcessedSearches { get; init; }
     public SearchCriteriaBase? SearchCriteria { get; init; }
@@ -61,6 +63,7 @@ public sealed record SearchContext
         PrimaryAlbumType PrimaryType,
         IReadOnlyList<string> Aliases,
         IReadOnlyList<string> Tracks,
+        IReadOnlyList<int> TrackDurations,
         SlskdSettings Settings,
         HashSet<string> ProcessedSearches,
         SearchCriteriaBase? SearchCriteria = null)
@@ -73,6 +76,7 @@ public sealed record SearchContext
         this.PrimaryType = PrimaryType;
         this.Aliases = Aliases;
         this.Tracks = Tracks;
+        this.TrackDurations = TrackDurations;
         this.Settings = Settings;
         this.ProcessedSearches = ProcessedSearches;
         this.SearchCriteria = SearchCriteria;
@@ -86,7 +90,9 @@ public sealed record SearchQuery
     public bool Interactive { get; init; }
     public bool ExpandDirectory { get; init; }
     public int TrackCount { get; init; }
+    public IReadOnlyList<int> TrackCounts { get; init; } = [];
     public IReadOnlyList<string> Tracks { get; init; } = [];
+    public IReadOnlyList<int> TrackDurations { get; init; } = [];
     public string? SearchText { get; init; }
 
     public static SearchQuery FromContext(SearchContext context) => new()
@@ -94,9 +100,11 @@ public sealed record SearchQuery
         Artist = context.SearchArtist,
         Album = context.SearchAlbum,
         Interactive = context.Interactive,
-        ExpandDirectory = false,
+        ExpandDirectory = !string.IsNullOrEmpty(context.SearchArtist) && !string.IsNullOrEmpty(context.SearchAlbum),
         TrackCount = context.TrackCount,
+        TrackCounts = context.TrackCounts,
         Tracks = context.Tracks,
+        TrackDurations = context.TrackDurations,
         SearchText = null
     };
 }

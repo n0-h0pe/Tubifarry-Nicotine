@@ -3,6 +3,7 @@ using NzbDrone.Core.Annotations;
 using NzbDrone.Core.ThingiProvider;
 using NzbDrone.Core.Validation;
 using System.Text.RegularExpressions;
+using Tubifarry.Indexers.Soulseek;
 
 namespace Tubifarry.Download.Clients.Soulseek
 {
@@ -15,11 +16,6 @@ namespace Tubifarry.Download.Clients.Soulseek
                 .ValidRootUrl()
                 .Must(url => !url.EndsWith('/'))
                 .WithMessage("Base URL must not end with a slash ('/').");
-
-            // API Key validation
-            RuleFor(c => c.ApiKey)
-                .NotEmpty()
-                .WithMessage("API Key is required.");
 
             // Timeout validation (only if it has a value)
             RuleFor(c => c.Timeout)
@@ -70,6 +66,11 @@ namespace Tubifarry.Download.Clients.Soulseek
         public bool IsLocalhost { get; set; }
 
         public string DownloadPath { get; set; } = string.Empty;
+
+        public string? SubdirectoryPattern { get; set; }
+
+        public SlskdDestinationConfig? GetDestinationConfig() =>
+            string.IsNullOrEmpty(DownloadPath) ? null : new SlskdDestinationConfig(DownloadPath, SubdirectoryPattern);
 
         public TimeSpan? GetTimeout() => Timeout == null ? null : TimeSpan.FromHours(Timeout.Value);
 

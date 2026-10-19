@@ -32,12 +32,17 @@ namespace Tubifarry.Core.Model
         public int Bitrate { get; set; }
 
         public int BitDepth { get; set; }
+
+        public int SampleRate { get; set; }
+
         public long Duration { get; set; }
 
         // Soulseek
         public long? Size { get; set; }
 
         public int Priotity { get; set; }
+        public bool ShowPriorityInTitle { get; set; }
+        public string SourceTag { get; set; } = "WEB";
         public List<string>? ExtraInfo { get; set; }
 
         public string DownloadProtocol { get; set; } = downloadProtocol;
@@ -48,15 +53,16 @@ namespace Tubifarry.Core.Model
         /// <summary>
         /// Converts AlbumData into a ReleaseInfo object.
         /// </summary>
-        public ReleaseInfo ToReleaseInfo() => new()
+        public ReleaseInfo ToReleaseInfo() => new ShareInfo()
         {
-            Guid = Guid ?? $"{IndexerName}-{AlbumId}-{Codec}-{Bitrate}-{BitDepth}",
+            Guid = (Guid ?? $"{IndexerName}-{AlbumId}-{Codec}-{Bitrate}-{BitDepth}").Replace('\\', '/'),
             Artist = ArtistName,
             Album = AlbumName,
             DownloadUrl = AlbumId,
             InfoUrl = InfoUrl,
             PublishDate = ReleaseDateTime == DateTime.MinValue ? DateTime.UtcNow : ReleaseDateTime,
             DownloadProtocol = DownloadProtocol,
+            Seeders = Priotity > 0 ? Priotity : null,
             Title = ConstructTitle(),
             Codec = Codec.ToString(),
             Resolution = CoverResolution,
@@ -99,16 +105,25 @@ namespace Tubifarry.Core.Model
             if (AudioFormatHelper.IsLossyFormat(Codec) && calculatedBitrate != 0)
                 title += $" [{Codec} {calculatedBitrate}kbps]";
             else if (!AudioFormatHelper.IsLossyFormat(Codec) && BitDepth != 0)
-                title += $" [{Codec} {BitDepth}bit]";
+                title += SampleRate > 0
+                    ? $" [{Codec} {BitDepth}bit/{FormatSampleRate(SampleRate)}]"
+                    : $" [{Codec} {BitDepth}bit]";
             else
                 title += $" [{Codec}]";
 
             if (ExtraInfo?.Count > 0)
                 title += string.Concat(ExtraInfo.Where(info => !string.IsNullOrEmpty(info)).Select(info => $" [{info}]"));
 
-            title += " [WEB]";
+            if (ShowPriorityInTitle && Priotity > 0)
+                title += $" [🔥 {Priotity}]";
+
+            title += $" [{SourceTag}]";
             return title;
         }
+
+        private static string FormatSampleRate(int sampleRate)
+            => (sampleRate / 1000.0).ToString("0.0", System.Globalization.CultureInfo.InvariantCulture) + "kHz";
+
 
         /// <summary>
         /// Normalizes the album name to handle featuring artists and other parentheses.

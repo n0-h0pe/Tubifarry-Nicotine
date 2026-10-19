@@ -34,6 +34,9 @@ namespace Tubifarry.Indexers.Soulseek
         private readonly object _rateLimitLock = new();
         private DateTime _rateLimitCacheTimestamp = DateTime.MinValue;
         private HashSet<string> _rateLimitedUsersCache = new(StringComparer.OrdinalIgnoreCase);
+        private readonly object _failureLock = new();
+        private DateTime _failureCacheTimestamp = DateTime.MinValue;
+        private Dictionary<string, int> _failureCountCache = new(StringComparer.OrdinalIgnoreCase);
 
         private SlskdSettings Settings => _indexer.Settings;
 
@@ -66,6 +69,7 @@ namespace Tubifarry.Indexers.Soulseek
                 SlskdSearchData searchTextData = SlskdSearchData.FromJson(indexerResponse.HttpRequest.ContentSummary);
                 HashSet<string>? ignoredUsers = GetIgnoredUsers(Settings.IgnoreListPath);
                 HashSet<string> rateLimitedUsers = GetRateLimitedUsers();
+                Dictionary<string, int> recentFailures = GetRecentFailureCounts();
 
                 foreach (SlskdFolderData response in searchResponse.Responses)
                 {
@@ -74,7 +78,10 @@ namespace Tubifarry.Indexers.Soulseek
 
                     IEnumerable<SlskdFileData> filteredFiles = SlskdFileData.GetFilteredFiles(response.Files, Settings.OnlyAudioFiles, Settings.IncludeFileExtensions);
 
-                    foreach (IGrouping<string, SlskdFileData> directoryGroup in filteredFiles.GroupBy(f => SlskdTextProcessor.GetDirectoryFromFilename(f.Filename)))
+                    List<IGrouping<string, SlskdFileData>> directoryGroups = SlskdTextProcessor.MergeDiscSubdirectories(
+                        filteredFiles.GroupBy(f => SlskdTextProcessor.GetDirectoryFromFilename(f.Filename)));
+
+                    foreach (IGrouping<string, SlskdFileData> directoryGroup in directoryGroups)
                     {
                         if (string.IsNullOrEmpty(directoryGroup.Key))
                             continue;
@@ -88,7 +95,8 @@ namespace Tubifarry.Indexers.Soulseek
                             LockedFiles = response.LockedFiles,
                             QueueLength = response.QueueLength,
                             Token = response.Token,
-                            FileCount = response.FileCount
+                            FileCount = response.FileCount,
+                            RecentFailures = recentFailures.GetValueOrDefault(response.Username)
                         };
 
                         IGrouping<string, SlskdFileData> finalGroup = directoryGroup;
@@ -102,9 +110,7 @@ namespace Tubifarry.Indexers.Soulseek
                         if (searchTextData.MinimumFiles > 0 || searchTextData.MaximumFiles.HasValue)
                         {
                             bool filterActive = (TrackCountFilterType)Settings.TrackCountFilter != TrackCountFilterType.Disabled;
-                            int fileCount = filterActive
-                                ? finalGroup.Count(f => AudioFormatHelper.GetAudioCodecFromExtension(f.Extension ?? Path.GetExtension(f.Filename) ?? "") != AudioFormat.Unknown)
-                                : finalGroup.Count();
+                            int fileCount = filterActive ? finalGroup.Count(IsAudioFile) : finalGroup.Count();
 
                             if (fileCount < searchTextData.MinimumFiles)
                             {
@@ -117,16 +123,24 @@ namespace Tubifarry.Indexers.Soulseek
                                 _logger.Trace($"Filtered (too many): {directoryGroup.Key} ({fileCount}/{searchTextData.MaximumFiles} {(filterActive ? "audio tracks" : "files")})");
                                 continue;
                             }
+
+                            if ((TrackCountFilterType)Settings.TrackCountFilter == TrackCountFilterType.Exact && searchTextData.TrackCounts is { Count: > 0 } editionCounts && !editionCounts.Contains(fileCount))
+                            {
+                                _logger.Trace($"Filtered (no edition has {fileCount} tracks): {directoryGroup.Key} ({string.Join("/", editionCounts)})");
+                                continue;
+                            }
                         }
 
-                        AlbumData albumData = _itemsParser.CreateAlbumData(searchResponse.Id, finalGroup, searchTextData, folderData, Settings, searchTextData.MinimumFiles);
+                        List<SlskdFileData> folderFiles = [.. finalGroup];
+                        int expectedTrackCount = GetClosestEditionTrackCount(searchTextData.TrackCounts, folderFiles.Count(IsAudioFile));
+                        AlbumData albumData = _itemsParser.CreateAlbumData(searchResponse.Id, finalGroup, searchTextData, folderData with { Files = folderFiles }, Settings, expectedTrackCount);
                         albumDatas.Add(albumData);
                     }
                 }
 
                 _sentry.UpdateSearchResultCount(searchResponse.Id, albumDatas.Count);
 
-                RemoveSearch(searchResponse.Id, albumDatas.Count != 0 && searchTextData.Interactive);
+                RemoveSearch(searchResponse.Id, searchTextData.Interactive);
             }
             catch (Exception ex)
             {
@@ -155,7 +169,7 @@ namespace Tubifarry.Indexers.Soulseek
             _logger.Trace($"Expanding directory for: {folderData.Username}:{directoryGroup.Key}");
 
             SlskdRequestGenerator? requestGenerator = _indexer.GetExtendedRequestGenerator() as SlskdRequestGenerator;
-            IGrouping<string, SlskdFileData>? expandedGroup = requestGenerator?.ExpandDirectory(folderData.Username, directoryGroup.Key, originalTrack).GetAwaiter().GetResult();
+            IGrouping<string, SlskdFileData>? expandedGroup = requestGenerator == null ? null : ExpandSourceDirectories(requestGenerator, folderData.Username, directoryGroup, originalTrack);
 
             if (expandedGroup != null)
             {
@@ -168,6 +182,34 @@ namespace Tubifarry.Indexers.Soulseek
             }
             return null;
         }
+
+        private static IGrouping<string, SlskdFileData>? ExpandSourceDirectories(SlskdRequestGenerator requestGenerator, string username, IGrouping<string, SlskdFileData> directoryGroup, SlskdFileData originalTrack)
+        {
+            List<string> sourceDirectories = directoryGroup
+                .Select(f => SlskdTextProcessor.GetDirectoryFromFilename(f.Filename))
+                .Where(d => !string.IsNullOrEmpty(d))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+            List<SlskdFileData> files = [];
+            foreach (string directory in sourceDirectories)
+            {
+                IGrouping<string, SlskdFileData>? expanded = requestGenerator.ExpandDirectory(username, directory, originalTrack).GetAwaiter().GetResult();
+                if (expanded == null)
+                    return null;
+                files.AddRange(expanded);
+            }
+
+            return files.Count == 0 ? null : files.GroupBy(_ => directoryGroup.Key).First();
+        }
+
+        private static bool IsAudioFile(SlskdFileData file) =>
+            AudioFormatHelper.GetAudioCodecFromExtension(file.Extension ?? Path.GetExtension(file.Filename) ?? "") != AudioFormat.Unknown;
+
+        private static int GetClosestEditionTrackCount(List<int>? editionTrackCounts, int audioTracks) =>
+            editionTrackCounts is { Count: > 0 } && audioTracks > 0
+                ? editionTrackCounts.OrderBy(count => Math.Abs(count - audioTracks)).ThenBy(count => count).First()
+                : 0;
 
         public void RemoveSearch(string searchId, bool delay = false)
         {
@@ -239,6 +281,52 @@ namespace Tubifarry.Indexers.Soulseek
                 _rateLimitedUsersCache = blocked;
                 _rateLimitCacheTimestamp = DateTime.UtcNow;
                 return blocked;
+            }
+        }
+
+        private Dictionary<string, int> GetRecentFailureCounts()
+        {
+            lock (_failureLock)
+            {
+                if (DateTime.UtcNow - _failureCacheTimestamp < TimeSpan.FromMinutes(30))
+                    return _failureCountCache;
+
+                Dictionary<string, int> counts = new(StringComparer.OrdinalIgnoreCase);
+                try
+                {
+                    int? indexerId = _indexer.Definition?.Id;
+
+                    IEnumerable<string> failedDownloadIds = _historyService
+                        .Since(DateTime.UtcNow.AddHours(-24), EntityHistoryEventType.DownloadFailed)
+                        .Select(h => h.DownloadId)
+                        .Where(id => !string.IsNullOrWhiteSpace(id))
+                        .Distinct(StringComparer.OrdinalIgnoreCase);
+
+                    foreach (string downloadId in failedDownloadIds)
+                    {
+                        DownloadHistory? grab = _downloadHistoryService.GetLatestGrab(downloadId);
+                        if (grab == null)
+                            continue;
+
+                        if (!string.Equals(grab.Protocol, nameof(SoulseekDownloadProtocol), StringComparison.OrdinalIgnoreCase))
+                            continue;
+
+                        if (indexerId.HasValue && grab.IndexerId != indexerId.Value)
+                            continue;
+
+                        string? username = ExtractUsernameFromUrl(grab.Release?.DownloadUrl);
+                        if (username != null)
+                            counts[username] = counts.GetValueOrDefault(username) + 1;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.Debug(ex, "Failed to collect download failure counts from history.");
+                }
+
+                _failureCountCache = counts;
+                _failureCacheTimestamp = DateTime.UtcNow;
+                return counts;
             }
         }
 
@@ -324,9 +412,11 @@ namespace Tubifarry.Indexers.Soulseek
         {
             try
             {
-                HttpRequest request = new HttpRequestBuilder($"{settings.BaseUrl}/api/v0/searches/{searchId}")
-                    .SetHeader("X-API-KEY", settings.ApiKey)
-                    .Build();
+                HttpRequestBuilder builder = new HttpRequestBuilder($"{settings.BaseUrl}/api/v0/searches/{searchId}");
+                if (!string.IsNullOrWhiteSpace(settings.ApiKey))
+                    builder.SetHeader("X-API-KEY", settings.ApiKey);
+
+                HttpRequest request = builder.Build();
                 request.Method = HttpMethod.Delete;
                 await _httpClient.ExecuteAsync(request);
             }
