@@ -148,8 +148,9 @@ jobs:
           YOUTUBE_SECRET: ${{ secrets.YOUTUBE_SECRET }}
           SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
         run: |
-          # Restore NuGet packages first
-          dotnet restore *.sln
+          # Restore NuGet packages first. NuGet audit is disabled because Lidarr treats warnings as
+          # errors, so advisories against Lidarr's own dependencies would otherwise fail the build
+          dotnet restore *.sln -p:NuGetAudit=false
           
           # Then build with all parameters
           dotnet build *.sln -c Release -f ${{ inputs.framework }} \
@@ -168,6 +169,7 @@ jobs:
             -p:YouTubeSecret=$YOUTUBE_SECRET \
             -p:SentryDsn=$SENTRY_DSN \
             -p:CI="true" \
+            -p:NuGetAudit=false \
             -v:n
 
       - name: Find Plugin Output Directory
